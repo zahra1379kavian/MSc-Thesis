@@ -450,12 +450,65 @@ def plot_bootstrap_distribution(samples, actual_value, p_value, title, xlabel, o
     fig.savefig(output_path, dpi=300)
     plt.close(fig)
     return output_path
+
+def _reshape_projection(y_values, trial_length):
+    y_values = np.asarray(y_values, dtype=np.float64).ravel()
+    if y_values.size % trial_length != 0:
+        raise ValueError(f"Projection length {y_values.size} is not divisible by trial length {trial_length}.")
+    num_trials = y_values.size // trial_length
+    return y_values, y_values.reshape(num_trials, trial_length)
+
+def plot_projection_trials(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, output_path, max_trials=30):
+    num_trials_total, trial_length = y_trials.shape
+    num_trials = min(max_trials, num_trials_total)
+    display_trials = y_trials[:num_trials]
+    time_axis = np.arange(trial_length)
+    finite_max = np.nanmax(np.abs(display_trials)) if np.any(np.isfinite(display_trials)) else 1.0
+    if not np.isfinite(finite_max) or finite_max <= 0:
+        finite_max = 1.0
+    spacing = finite_max * 1.5 + 1e-3
+    fig_height = min(14.0, max(6.0, 4.0 + num_trials * 0.05))
+
+    fig, ax = plt.subplots(figsize=(9, fig_height))
+    for idx, trial_values in enumerate(display_trials):
+        offset = idx * spacing
+        ax.plot(time_axis, trial_values + offset, linewidth=0.8, alpha=0.9, color="#1f77b4")
+
+    ax.set_xlabel("Time point")
+    ax.set_ylabel("Trial index (offset)")
+    subtitle = ""
+    if num_trials_total > num_trials:
+        subtitle = f" (showing first {num_trials} / {num_trials_total})"
+    ax.set_xlim(time_axis[0], time_axis[-1])
+    y_ticks = np.arange(num_trials) * spacing
+    ax.set_yticks(y_ticks)
+    ax.set_yticklabels([str(i + 1) for i in range(num_trials)])
+    ax.set_title(f"y | alpha_task={task_alpha:g}, alpha_bold={bold_alpha:g}, alpha_beta={beta_alpha:g}, rho={rho_value:g}{subtitle}")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+    return output_path
+
+def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file_prefix,
+                            task_alpha, bold_alpha, beta_alpha, rho_value):
+    bold_pca_components = np.asarray(bold_pca_components, dtype=np.float64)
+    y_projection = np.asarray(pca_weights, dtype=np.float64) @ bold_pca_components
+    y_vector_path = f"y_projection_{file_prefix}.npy"
+    np.save(y_vector_path, y_projection.astype(np.float32))
+
+    _, y_trials = _reshape_projection(y_projection, trial_length)
+    y_trials_path = f"y_projection_trials_{file_prefix}.npy"
+    np.save(y_trials_path, y_trials.astype(np.float32))
+
+    plot_path = f"y_projection_trials_{file_prefix}.png"
+    plot_projection_trials(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, plot_path)
+    return 
 # %%
 ridge_penalty = 1e-6
 solver_name = "MOSEK"
 soc_ratio = 0.95
 
-alpha_sweep = [{"task_penalty": 0.5, "bold_penalty": 0.25, "beta_penalty": 50}]
+alpha_sweep = [{"task_penalty": 0.5, "bold_penalty": 0.25, "beta_penalty": 5}]
 rho_sweep = [0.2, soc_ratio]
 bootstrap_iterations = 1000
 
@@ -466,6 +519,8 @@ def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
     test_data = prepare_data_func(run_test, bold_data_test, beta_glm, beta_volume_filter_test,
                                  brain_mask, csf_mask, gray_mask,  behavior_matrix_test, pca_model_train, trial_len, num_trials, 
                                  reuse_nan_mask=train_data["nan_mask_flat"], reuse_active_coords=train_data["active_coords"])
+
+    bold_pca_components = np.asarray(pca_model_train.eigvec, dtype=np.float64)
 
     for alpha_setting in alpha_settings:
         task_alpha = alpha_setting["task_penalty"]
@@ -492,6 +547,9 @@ def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
             weighted_voxel_activity = voxel_weights[:, None] * beta_volume_clean_finite
             weighted_beta_path = f"beta_weighted_activity_{file_prefix}.npy"
             np.save(weighted_beta_path, weighted_voxel_activity.astype(np.float32))
+
+            save_projection_outputs(component_weights, bold_pca_components, trial_len, file_prefix, 
+                                    task_alpha, bold_alpha, beta_alpha, rho_value)
 
             train_metrics = evaluate_projection(train_data, component_weights)
             test_metrics = evaluate_projection(test_data, component_weights)
