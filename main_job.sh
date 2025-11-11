@@ -15,9 +15,9 @@ module purge
 module load intel-oneapi-compilers/2023.1.0
 module load python/3.11
 
-export HOME=/scratch/st-mmckeown-1/zkavian/fmri_models/
+export HOME=/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis
 source /scratch/st-mmckeown-1/zkavian/fmri_models/myenv/bin/activate
-cd /scratch/st-mmckeown-1/zkavian/fmri_models/
+cd /scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/
 
 python main_bootstrap.py
 # python matrix_diagnostics.py

@@ -1,0 +1,16 @@
+__pycache__
+*.log
+*.tmp
+*.csv
+*.json
+!*.py
+!*.ipynb"
+
+*.npy
+*.mat
+*.err
+*.out
+*.nii.gz
+empca/
+mosek/
+*.png
