@@ -109,6 +109,28 @@ def standardize_matrix(matrix):
     print(f"range after: {np.min(normalized)}, {np.max(normalized)}")
     return normalized.astype(matrix.dtype, copy=False)
 
+def _extract_active_bold_trials(bold_timeseries, coords, num_trials, trial_length):
+    if coords is None or len(coords) != 3:
+        return None
+    coord_arrays = tuple(np.asarray(axis, dtype=int) for axis in coords)
+    if coord_arrays[0].size == 0:
+        return np.zeros((0, num_trials, trial_length), dtype=np.float32)
+
+    bold_active = bold_timeseries[coord_arrays[0], coord_arrays[1], coord_arrays[2], :]
+    num_voxels, num_timepoints = bold_active.shape
+    active_bold = np.full((num_voxels, num_trials, trial_length), np.nan, dtype=np.float32)
+
+    start_idx = 0
+    for trial_idx in range(num_trials):
+        end_idx = start_idx + trial_length
+        if end_idx > num_timepoints:
+            raise ValueError("Active BOLD data does not contain enough timepoints for all trials.")
+        active_bold[:, trial_idx, :] = bold_active[:, start_idx:end_idx]
+        start_idx += trial_length
+        if start_idx in (270, 560):
+            start_idx += 20
+    return active_bold
+
 # %%
 def prepare_data_func(run_id, bold_timeseries, beta_glm_volume, filtered_beta_volume,
                       brain_mask, csf_mask, gray_matter_mask_volume, 
@@ -143,11 +165,15 @@ def prepare_data_func(run_id, bold_timeseries, beta_glm_volume, filtered_beta_vo
     beta_gray = beta_volume[gray_voxel_mask]
 
     skipping_preprocessing = reuse_nan_mask is not None
+    active_bold = None
+    active_flat_indices = None
 
     if skipping_preprocessing:
         print("Reusing voxel mask from training run; skipping preprocessing.", flush=True)
         nan_mask_flat = np.asarray(reuse_nan_mask, dtype=bool).ravel()
         active_coords = tuple(np.array(coord) for coord in reuse_active_coords)
+        active_flat_indices = np.ravel_multi_index(active_coords, filtered_beta_volume.shape[:3])
+        active_bold = _extract_active_bold_trials(bold_timeseries, active_coords, num_trials, trial_length)
     else:
         nan_voxels = np.isnan(beta_gray).all(axis=1)
         if np.any(nan_voxels):
@@ -200,6 +226,7 @@ def prepare_data_func(run_id, bold_timeseries, beta_glm_volume, filtered_beta_vo
 
         active_beta = active_beta[keep_mask]
         active_bold = active_bold[keep_mask]
+        active_flat_indices = active_flat_indices[keep_mask]
         active_indices = active_indices[keep_mask]
         active_coords = tuple(coord[keep_mask] for coord in active_coords)
 
@@ -231,7 +258,8 @@ def prepare_data_func(run_id, bold_timeseries, beta_glm_volume, filtered_beta_vo
     return {"nan_mask_flat": nan_mask_flat, "active_coords": tuple(np.array(coord) for coord in active_coords),
         "coeff_pinv": coeff_pinv, "beta_centered": beta_centered, "behavior_centered": behavior_centered, 
         "normalized_behaviors": normalized_behaviors, "behavior_observed": behavior_observed, "beta_observed": beta_observed,
-        "beta_volume_clean": beta_volume_clean, "C_task": C_task, "C_bold": C_bold, "C_beta": C_beta}
+        "beta_volume_clean": beta_volume_clean, "C_task": C_task, "C_bold": C_bold, "C_beta": C_beta,
+        "active_bold": active_bold, "active_flat_indices": active_flat_indices}
 
 # %%
 def calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta):
@@ -458,6 +486,71 @@ def _reshape_projection(y_values, trial_length):
     num_trials = y_values.size // trial_length
     return y_values, y_values.reshape(num_trials, trial_length)
 
+def compute_component_active_bold_correlation(voxel_weights, run_data):
+    active_bold = run_data.get("active_bold")
+    active_flat_indices = run_data.get("active_flat_indices")
+    nan_mask_flat = run_data.get("nan_mask_flat")
+    active_flat_indices = active_flat_indices.ravel()
+
+    valid_flat_indices = np.flatnonzero(~np.asarray(nan_mask_flat, dtype=bool).ravel())
+    voxel_weights = voxel_weights.ravel()
+    positions = np.searchsorted(valid_flat_indices, active_flat_indices)
+    if np.any(positions >= valid_flat_indices.size) or not np.array_equal(valid_flat_indices[positions], active_flat_indices):
+        raise ValueError("Active voxel indices could not be mapped to voxel weight entries.")
+
+    active_voxel_weights = voxel_weights[positions]
+    bold_matrix = np.asarray(active_bold, dtype=np.float64).reshape(active_bold.shape[0], -1)
+    timepoints = bold_matrix.shape[1]
+    projection = np.full(timepoints, np.nan, dtype=np.float64)
+
+    finite_mask = np.isfinite(bold_matrix)
+    for t_idx in range(timepoints):
+        voxel_mask = finite_mask[:, t_idx]
+        if not np.any(voxel_mask):
+            continue
+        projection[t_idx] = np.dot(active_voxel_weights[voxel_mask], bold_matrix[voxel_mask, t_idx])
+
+    correlations = np.full(bold_matrix.shape[0], np.nan, dtype=np.float32)
+    projection_finite = np.isfinite(projection)
+    for voxel_idx, voxel_series in enumerate(bold_matrix):
+        voxel_finite = np.isfinite(voxel_series)
+        joint_mask = projection_finite & voxel_finite
+        if np.count_nonzero(joint_mask) < 2:
+            continue
+        correlations[voxel_idx] = np.corrcoef(projection[joint_mask], voxel_series[joint_mask])[0, 1]
+    return projection, correlations
+
+def save_active_bold_correlation_map(correlations, active_coords, volume_shape, anat_img, file_prefix):
+    if correlations is None or active_coords is None or volume_shape is None or anat_img is None:
+        return {}
+
+    coord_arrays = tuple(np.asarray(axis, dtype=int) for axis in active_coords)
+    corr_path = f"active_bold_corr_{file_prefix}.npy"
+    np.save(corr_path, correlations.astype(np.float32))
+
+    volume = np.full(volume_shape, np.nan, dtype=np.float32)
+    if coord_arrays and coord_arrays[0].size:
+        volume[coord_arrays] = correlations
+
+    corr_img = nib.Nifti1Image(volume, anat_img.affine, anat_img.header)
+    volume_path = f"active_bold_corr_{file_prefix}.nii.gz"
+    nib.save(corr_img, volume_path)
+
+    plot_path = ""
+    if np.any(np.isfinite(correlations)):
+        display = plotting.plot_stat_map(
+            corr_img,
+            bg_img=anat_img,
+            display_mode="ortho",
+            colorbar=True,
+            title="corr(component_weights@active_bold, active_bold)",
+        )
+        plot_path = f"active_bold_corr_{file_prefix}.png"
+        display.savefig(plot_path, dpi=300)
+        display.close()
+
+    return {"corr_array": corr_path, "corr_volume": volume_path, "corr_plot": plot_path, "corr_view": view_path}
+
 def plot_projection_trials(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, output_path, max_trials=30):
     num_trials_total, trial_length = y_trials.shape
     num_trials = min(max_trials, num_trials_total)
@@ -547,6 +640,25 @@ def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
             weighted_voxel_activity = voxel_weights[:, None] * beta_volume_clean_finite
             weighted_beta_path = f"beta_weighted_activity_{file_prefix}.npy"
             np.save(weighted_beta_path, weighted_voxel_activity.astype(np.float32))
+
+            corr_outputs = {}
+            try:
+                projection_signal, voxel_correlations = compute_component_active_bold_correlation(voxel_weights, train_data)
+            except ValueError as exc:
+                projection_signal, voxel_correlations = None, None
+                print(f"Skipping active BOLD correlation computation: {exc}", flush=True)
+
+            if projection_signal is not None and np.any(np.isfinite(projection_signal)):
+                projection_path = f"component_active_bold_projection_{file_prefix}.npy"
+                np.save(projection_path, projection_signal.astype(np.float32))
+
+            if voxel_correlations is not None:
+                corr_outputs = save_active_bold_correlation_map(voxel_correlations,
+                    train_data.get("active_coords"), beta_volume_filter_train.shape[:3], anat_img, file_prefix)
+                if corr_outputs:
+                    saved_items = ", ".join(f"{label}={path}" for label, path in corr_outputs.items() if path)
+                    if saved_items:
+                        print(f"Saved active BOLD correlations: {saved_items}", flush=True)
 
             save_projection_outputs(component_weights, bold_pca_components, trial_len, file_prefix, 
                                     task_alpha, bold_alpha, beta_alpha, rho_value)
