@@ -431,7 +431,7 @@ def perform_weight_shuffle_tests(train_data, test_data, weights, task_alpha, bol
 
     penalty_summary = {label: summarize_bootstrap(values, reference=baseline_penalties.get(label, 0.0), direction="less") 
                        for label, values in penalty_arrays.items()}
-    total_loss_summary = summarize_bootstrap(total_loss_array, reference=baseline_loss, direction = "loss")
+    total_loss_summary = summarize_bootstrap(total_loss_array, reference=baseline_loss, direction = "less")
     train_direction = "greater" if baseline_train_corr >= 0 else "less"
     test_direction = "greater" if baseline_test_corr >= 0 else "less"
     correlation_summary = {"train": summarize_bootstrap(train_corr_array, reference=baseline_train_corr, direction=train_direction),
@@ -536,20 +536,12 @@ def save_active_bold_correlation_map(correlations, active_coords, volume_shape, 
     volume_path = f"active_bold_corr_{file_prefix}.nii.gz"
     nib.save(corr_img, volume_path)
 
-    plot_path = ""
     if np.any(np.isfinite(correlations)):
-        display = plotting.plot_stat_map(
-            corr_img,
-            bg_img=anat_img,
-            display_mode="ortho",
-            colorbar=True,
-            title="corr(component_weights@active_bold, active_bold)",
-        )
-        plot_path = f"active_bold_corr_{file_prefix}.png"
-        display.savefig(plot_path, dpi=300)
-        display.close()
+        display = plotting.view_img(corr_img, bg_img=anat_img, colorbar=True, symmetric_cmap=False,
+            title="corr(component_weights@active_bold, active_bold)")
+        display.save_as_html(f"active_bold_corr_{file_prefix}.html")
 
-    return {"corr_array": corr_path, "corr_volume": volume_path, "corr_plot": plot_path, "corr_view": view_path}
+    return
 
 def plot_projection_trials(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, output_path, max_trials=30):
     num_trials_total, trial_length = y_trials.shape
@@ -601,7 +593,7 @@ ridge_penalty = 1e-6
 solver_name = "MOSEK"
 soc_ratio = 0.95
 
-alpha_sweep = [{"task_penalty": 0.5, "bold_penalty": 0.25, "beta_penalty": 5}]
+alpha_sweep = [{"task_penalty": 0.5, "bold_penalty": 0.25, "beta_penalty": 50}]
 rho_sweep = [0.2, soc_ratio]
 bootstrap_iterations = 1000
 
@@ -653,12 +645,8 @@ def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
                 np.save(projection_path, projection_signal.astype(np.float32))
 
             if voxel_correlations is not None:
-                corr_outputs = save_active_bold_correlation_map(voxel_correlations,
+                save_active_bold_correlation_map(voxel_correlations,
                     train_data.get("active_coords"), beta_volume_filter_train.shape[:3], anat_img, file_prefix)
-                if corr_outputs:
-                    saved_items = ", ".join(f"{label}={path}" for label, path in corr_outputs.items() if path)
-                    if saved_items:
-                        print(f"Saved active BOLD correlations: {saved_items}", flush=True)
 
             save_projection_outputs(component_weights, bold_pca_components, trial_len, file_prefix, 
                                     task_alpha, bold_alpha, beta_alpha, rho_value)
