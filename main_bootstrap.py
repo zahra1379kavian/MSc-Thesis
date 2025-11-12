@@ -73,20 +73,37 @@ def calcu_matrices_func(beta_pca, bold_pca, behave_mat, behave_indice, trial_len
 
     print("L_var...", flush=True)
     C_bold = np.zeros((bold_pca_reshape.shape[0], bold_pca_reshape.shape[0]), dtype=np.float32)
+    # valid_bold_pairs = 0
     for i in range(num_trials - 1):
         x1 = bold_pca_reshape[:, i, :]
         x2 = bold_pca_reshape[:, i + 1, :]
+        # if np.isnan(x1).any() or np.isnan(x2).any():
+        #     continue
+    #     diff = x1 - x2
+    #     C_bold += diff @ diff.T
+    #     valid_bold_pairs += 1
+    # if valid_bold_pairs > 0:
+    #     C_bold /= valid_bold_pairs
         C_bold += (x1 - x2) @ (x1 - x2).T
     C_bold /= (num_trials - 1)
 
     print("L_var...", flush=True)
     C_beta = np.zeros((beta_pca.shape[0], beta_pca.shape[0]), dtype=np.float32)
+    # valid_beta_pairs = 0
     for i in range(num_trials - 1):
         x1 = beta_pca[:, i]
         x2 = beta_pca[:, i + 1]
         diff = x1 - x2
         C_beta += np.outer(diff, diff)
     C_beta /= (num_trials - 1)
+
+        # if np.isnan(x1).any() or np.isnan(x2).any():
+        #     continue
+    #     diff = x1 - x2
+    #     C_beta += np.outer(diff, diff)
+    #     valid_beta_pairs += 1
+    # if valid_beta_pairs > 0:
+    #     C_beta /= valid_beta_pairs
 
     return C_task, C_bold, C_beta, behavior_selected
 
@@ -236,16 +253,25 @@ def prepare_data_func(run_id, bold_timeseries, beta_glm_volume, filtered_beta_vo
 
     bold_pca_components = pca_model.eigvec
     coeff_pinv = np.linalg.pinv(pca_model.coeff)
+    # beta_pca = coeff_pinv @ beta_volume_clean
     beta_pca = coeff_pinv @ np.nan_to_num(beta_volume_clean)
 
     (C_task, C_bold, C_beta, behavior_vector) = calcu_matrices_func(beta_pca, bold_pca_components, behavioral_matrix, 
                                                                     behave_indice, trial_len=trial_length, num_trials=num_trials)
+    
+    # beta_pca = coeff_pinv @ beta_volume_clean
+
+    # for name, matrix in (("C_task", C_task), ("C_bold", C_bold), ("C_beta", C_beta)):
+    #     if not np.all(np.isfinite(matrix)):
+    #         raise ValueError(f"{name} contains NaN or Inf values after calcu_matrices_func")
 
     trial_mask = np.isfinite(behavior_vector)
     behavior_observed = behavior_vector[trial_mask]
     behavior_mean = np.mean(behavior_observed)
     behavior_centered = behavior_observed - behavior_mean
     behavior_norm = np.linalg.norm(behavior_centered)
+    # if not np.isfinite(behavior_norm) or behavior_norm <= np.finfo(np.float64).eps:
+    #     raise ValueError("Behavior vector has zero variance; SOC normalization undefined.")
     normalized_behaviors = behavior_centered / behavior_norm
 
     beta_observed = beta_pca[:, trial_mask]
@@ -537,13 +563,13 @@ def save_active_bold_correlation_map(correlations, active_coords, volume_shape, 
     nib.save(corr_img, volume_path)
 
     if np.any(np.isfinite(correlations)):
-        display = plotting.view_img(corr_img, bg_img=anat_img, colorbar=True, symmetric_cmap=False,
+        display = plotting.view_img(corr_img, bg_img=anat_img, colorbar=True, symmetric_cmap=False, cmap='jet',
             title="corr(component_weights@active_bold, active_bold)")
         display.save_as_html(f"active_bold_corr_{file_prefix}.html")
 
     return
 
-def plot_projection_trials(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, output_path, max_trials=30):
+def plot_projection_trials(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, output_path, max_trials=10):
     num_trials_total, trial_length = y_trials.shape
     num_trials = min(max_trials, num_trials_total)
     display_trials = y_trials[:num_trials]
@@ -551,6 +577,7 @@ def plot_projection_trials(y_trials, task_alpha, bold_alpha, beta_alpha, rho_val
     finite_max = np.nanmax(np.abs(display_trials)) if np.any(np.isfinite(display_trials)) else 1.0
     if not np.isfinite(finite_max) or finite_max <= 0:
         finite_max = 1.0
+    print(f"finite_max: {finite_max}")
     spacing = finite_max * 1.5 + 1e-3
     fig_height = min(14.0, max(6.0, 4.0 + num_trials * 0.05))
 

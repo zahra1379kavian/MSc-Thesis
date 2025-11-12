@@ -14,3 +14,4 @@ __pycache__
 empca/
 mosek/
 *.png
+*.html
