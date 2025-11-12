@@ -781,7 +781,7 @@ solver_name = "MOSEK"
 soc_ratio = 0.95
 
 alpha_sweep = [{"task_penalty": 0.5, "bold_penalty": 0.25, "beta_penalty": 50}]
-rho_sweep = [0.2, 0.5, soc_ratio]
+rho_sweep = [0.2, 0.5, 0.95]
 bootstrap_iterations = 1000
 trial_downsample_metric = "mean"  # Change to "median" or provide a callable to adjust trial-level aggregation.
 
