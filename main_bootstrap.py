@@ -1,22 +1,27 @@
-import nibabel as nib
-import numpy as np
+import argparse
+import os
+from itertools import product
+from os.path import join
+
+import cvxpy as cp
 import matplotlib
 import matplotlib.pyplot as plt
-from os.path import join
+import nibabel as nib
+import numpy as np
+from nilearn import plotting
+from scipy.io import loadmat
 from scipy.stats import ttest_1samp
 from statsmodels.stats.multitest import multipletests
-from scipy.io import loadmat
-import cvxpy as cp
-from nilearn import plotting
+
 matplotlib.use("Agg")
-import argparse
 
 
-def _asarray_filled(data, dtype=np.float64):
-    """Convert masked arrays to dense ndarrays with NaNs for masked entries."""
+# %%
+def _asarray_filled(data, dtype=np.float32):
     if isinstance(data, np.ma.MaskedArray):
         data = data.filled(np.nan)
     return np.asarray(data, dtype=dtype)
+
 # %% 
 ses = 1
 sub = "04"
@@ -80,23 +85,14 @@ def calcu_matrices_func(beta_pca, bold_pca, behave_mat, behave_indice, trial_len
 
     # print("L_var...", flush=True)
     C_bold = np.zeros((bold_pca_reshape.shape[0], bold_pca_reshape.shape[0]), dtype=np.float32)
-    # valid_bold_pairs = 0
     for i in range(num_trials - 1):
         x1 = bold_pca_reshape[:, i, :]
         x2 = bold_pca_reshape[:, i + 1, :]
-        # if np.isnan(x1).any() or np.isnan(x2).any():
-        #     continue
-    #     diff = x1 - x2
-    #     C_bold += diff @ diff.T
-    #     valid_bold_pairs += 1
-    # if valid_bold_pairs > 0:
-    #     C_bold /= valid_bold_pairs
         C_bold += (x1 - x2) @ (x1 - x2).T
     C_bold /= (num_trials - 1)
 
     # print("L_var...", flush=True)
     C_beta = np.zeros((beta_pca.shape[0], beta_pca.shape[0]), dtype=np.float32)
-    # valid_beta_pairs = 0
     for i in range(num_trials - 1):
         x1 = beta_pca[:, i]
         x2 = beta_pca[:, i + 1]
@@ -104,58 +100,37 @@ def calcu_matrices_func(beta_pca, bold_pca, behave_mat, behave_indice, trial_len
         C_beta += np.outer(diff, diff)
     C_beta /= (num_trials - 1)
 
-        # if np.isnan(x1).any() or np.isnan(x2).any():
-        #     continue
-    #     diff = x1 - x2
-    #     C_beta += np.outer(diff, diff)
-    #     valid_beta_pairs += 1
-    # if valid_beta_pairs > 0:
-    #     C_beta /= valid_beta_pairs
-
     return C_task, C_bold, C_beta, behavior_selected
 
-# %%
 def standardize_matrix(matrix):
-    array = np.asarray(matrix, dtype=np.float64)
-
-    sym_array = 0.5 * (array + array.T)
-    if not np.all(np.isfinite(sym_array)):
-        sym_array = np.nan_to_num(sym_array, nan=0.0, posinf=0.0, neginf=0.0)
-
+    sym_array = 0.5 * (matrix + matrix.T)
     trace_value = np.trace(sym_array)
     if not np.isfinite(trace_value) or trace_value == 0:
         trace_value = 1.0
-    
-    # print(f"range before: {np.min(array)}, {np.max(array)}")
-    # print(f"trace: {trace_value}")
-    normalized = sym_array / trace_value
-    normalized *= sym_array.shape[0]
+    normalized = sym_array / trace_value * sym_array.shape[0]
     # print(f"range after: {np.min(normalized)}, {np.max(normalized)}")
     return normalized.astype(matrix.dtype, copy=False)
 
-def _extract_active_bold_trials(bold_timeseries, coords, num_trials, trial_length):
-    if coords is None or len(coords) != 3:
-        return None
-    coord_arrays = tuple(np.asarray(axis, dtype=int) for axis in coords)
-    if coord_arrays[0].size == 0:
-        return np.zeros((0, num_trials, trial_length), dtype=np.float32)
-
-    bold_active = bold_timeseries[coord_arrays[0], coord_arrays[1], coord_arrays[2], :]
-    num_voxels, num_timepoints = bold_active.shape
-    active_bold = np.full((num_voxels, num_trials, trial_length), np.nan, dtype=np.float32)
+def _reshape_trials(bold_matrix, num_trials, trial_length, error_label="BOLD"):
+    num_voxels, num_timepoints = bold_matrix.shape
+    bold_by_trial = np.full((num_voxels, num_trials, trial_length), np.nan, dtype=np.float32)
 
     start_idx = 0
     for trial_idx in range(num_trials):
         end_idx = start_idx + trial_length
         if end_idx > num_timepoints:
-            raise ValueError("Active BOLD data does not contain enough timepoints for all trials.")
-        active_bold[:, trial_idx, :] = bold_active[:, start_idx:end_idx]
+            raise ValueError(f"{error_label} data does not contain enough timepoints for all trials.")
+        bold_by_trial[:, trial_idx, :] = bold_matrix[:, start_idx:end_idx]
         start_idx += trial_length
         if start_idx in (270, 560):
             start_idx += 20
-    return active_bold
+    return bold_by_trial
 
-# %%
+def _extract_active_bold_trials(bold_timeseries, coords, num_trials, trial_length):
+    coord_arrays = tuple(np.asarray(axis, dtype=int) for axis in coords)
+    bold_active = bold_timeseries[coord_arrays[0], coord_arrays[1], coord_arrays[2], :]
+    return _reshape_trials(bold_active, num_trials, trial_length, error_label="Active BOLD")
+
 def prepare_data_func(run_id, bold_timeseries, beta_glm_volume, filtered_beta_volume,
                       brain_mask, csf_mask, gray_matter_mask_volume, 
                       behavioral_matrix, pca_model, trial_length, num_trials, 
@@ -171,17 +146,7 @@ def prepare_data_func(run_id, bold_timeseries, beta_glm_volume, filtered_beta_vo
     gray_voxel_coords = np.where(gray_voxel_mask_volume)
 
     bold_gray = bold_timeseries[gray_voxel_coords]
-    num_voxels, num_timepoints = bold_gray.shape
-    bold_by_trial = np.full((num_voxels, num_trials, trial_length), np.nan, dtype=np.float32)
-    start_idx = 0
-    for trial_idx in range(num_trials):
-        end_idx = start_idx + trial_length
-        if end_idx > num_timepoints:
-            raise ValueError("Masked BOLD data does not contain enough timepoints for all trials.")
-        bold_by_trial[:, trial_idx, :] = bold_gray[:, start_idx:end_idx]
-        start_idx += trial_length
-        if start_idx in (270, 560):
-            start_idx += 20
+    bold_by_trial = _reshape_trials(bold_gray, num_trials, trial_length, error_label="Masked BOLD")
 
     # print("Masking GLM betas...", flush=True)
     beta_run1, beta_run2 = beta_glm_volume[:, 0, 0, :90], beta_glm_volume[:, 0, 0, 90:]
@@ -219,7 +184,6 @@ def prepare_data_func(run_id, bold_timeseries, beta_glm_volume, filtered_beta_vo
         keep_voxel = voxel_outlier_fraction <= 0.5
         trial_outliers = outlier_mask[keep_voxel]
         gray_voxel_coords = tuple(coord[keep_voxel] for coord in gray_voxel_coords)
-        # keep_trial = np.logical_not(outlier_mask[keep_voxel])
 
         cleaned_beta = beta_gray[keep_voxel]
         cleaned_beta[trial_outliers] = np.nan 
@@ -261,33 +225,24 @@ def prepare_data_func(run_id, bold_timeseries, beta_glm_volume, filtered_beta_vo
 
     bold_pca_components = pca_model.eigvec
     coeff_pinv = np.linalg.pinv(pca_model.coeff)
-    # beta_pca = coeff_pinv @ beta_volume_clean
     beta_pca = coeff_pinv @ np.nan_to_num(beta_volume_clean)
 
     (C_task, C_bold, C_beta, behavior_vector) = calcu_matrices_func(beta_pca, bold_pca_components, behavioral_matrix, 
                                                                     behave_indice, trial_len=trial_length, num_trials=num_trials)
+
+    C_task = standardize_matrix(C_task)
+    C_bold = standardize_matrix(C_bold)
+    C_beta = standardize_matrix(C_beta)
     
-    # beta_pca = coeff_pinv @ beta_volume_clean
-
-    # for name, matrix in (("C_task", C_task), ("C_bold", C_bold), ("C_beta", C_beta)):
-    #     if not np.all(np.isfinite(matrix)):
-    #         raise ValueError(f"{name} contains NaN or Inf values after calcu_matrices_func")
-
     trial_mask = np.isfinite(behavior_vector)
     behavior_observed = behavior_vector[trial_mask]
     behavior_mean = np.mean(behavior_observed)
     behavior_centered = behavior_observed - behavior_mean
     behavior_norm = np.linalg.norm(behavior_centered)
-    # if not np.isfinite(behavior_norm) or behavior_norm <= np.finfo(np.float64).eps:
-    #     raise ValueError("Behavior vector has zero variance; SOC normalization undefined.")
     normalized_behaviors = behavior_centered / behavior_norm
 
     beta_observed = beta_pca[:, trial_mask]
     beta_centered = beta_observed - np.mean(beta_observed, axis=1, keepdims=True)
-
-    C_task = standardize_matrix(C_task)
-    C_bold = standardize_matrix(C_bold)
-    C_beta = standardize_matrix(C_beta)
 
     return {"nan_mask_flat": nan_mask_flat, "active_coords": tuple(np.array(coord) for coord in active_coords),
         "coeff_pinv": coeff_pinv, "beta_centered": beta_centered, "behavior_centered": behavior_centered, 
@@ -295,7 +250,6 @@ def prepare_data_func(run_id, bold_timeseries, beta_glm_volume, filtered_beta_vo
         "beta_volume_clean": beta_volume_clean, "C_task": C_task, "C_bold": C_bold, "C_beta": C_beta,
         "active_bold": active_bold, "active_beta": active_beta, "active_flat_indices": active_flat_indices}
 
-# %%
 def calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta):
     beta_centered = run_data["beta_centered"]
     n_components = beta_centered.shape[0]
@@ -309,7 +263,6 @@ def calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta):
 
     return {"task": task_penalty, "bold": bold_penalty, "beta": beta_penalty}, total_penalty
 
-# %%
 def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, solver_name, phro):
     beta_centered = run_data["beta_centered"]
     normalized_behaviors = run_data["normalized_behaviors"]
@@ -376,7 +329,6 @@ def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, solver_name,
     return {"weights": solution_weights, "branch": solution_branch, "total_loss": total_loss, "Y": y,
             "objective_positive": objective_positive, "objective_negative": objective_negative, "penalty_contributions": contributions}
 
-# %%
 def evaluate_projection(run_data, weights):
     beta_centered = run_data["beta_centered"]
     behavior_centered = run_data["behavior_centered"]
@@ -389,8 +341,6 @@ def evaluate_projection(run_data, weights):
     normalized_behaviors = normalized_behaviors[finite_mask]
 
     metrics = {"pearson": np.nan, "r2": np.nan, "mse": np.nan, "soc_slack": np.nan}
-    if projection.size == 0:
-        return metrics
     metrics["pearson"] = _safe_pearsonr(projection, behavior_centered)
     residuals = behavior_centered - projection
     metrics["mse"] = np.mean(residuals**2)
@@ -415,7 +365,6 @@ def summarize_bootstrap(values, reference=0.0, direction="less"):
         summary["p_value"] = (np.count_nonzero(values_array <= reference) + 1) / (values_array.size + 1)
     return summary
 
-# %%
 def perform_weight_shuffle_tests(train_data, test_data, weights, task_alpha, bold_alpha, beta_alpha, rho_value, num_samples):
     weights = weights.ravel()
     rng = np.random.default_rng()
@@ -457,6 +406,7 @@ def perform_weight_shuffle_tests(train_data, test_data, weights, task_alpha, bol
 
         train_metrics = evaluate_projection(train_data, noisy_weights)
         test_metrics = evaluate_projection(test_data, noisy_weights)
+
         train_corr_samples.append(train_metrics["pearson"])
         test_corr_samples.append(test_metrics["pearson"])
 
@@ -480,7 +430,6 @@ def perform_weight_shuffle_tests(train_data, test_data, weights, task_alpha, bol
             "num_requested": num_samples, "num_successful": num_successful, "num_failed": num_failed,
             "penalty_samples": penalty_arrays, "total_loss_samples": total_loss_array, "correlation_samples": {"train": train_corr_array, "test": test_corr_array}}
 
-# %%
 def plot_bootstrap_distribution(samples, actual_value, p_value, title, xlabel, output_path):
     finite_samples = samples[np.isfinite(samples)]
 
@@ -517,8 +466,6 @@ def plot_bootstrap_distribution(samples, actual_value, p_value, title, xlabel, o
 
 def _reshape_projection(y_values, trial_length):
     y_values = np.asarray(y_values, dtype=np.float64).ravel()
-    if y_values.size % trial_length != 0:
-        raise ValueError(f"Projection length {y_values.size} is not divisible by trial length {trial_length}.")
     num_trials = y_values.size // trial_length
     return y_values, y_values.reshape(num_trials, trial_length)
 
@@ -526,9 +473,6 @@ def _compute_weighted_active_bold_projection(voxel_weights, run_data):
     active_bold = run_data.get("active_bold")
     active_flat_indices = run_data.get("active_flat_indices")
     nan_mask_flat = run_data.get("nan_mask_flat")
-    if active_bold is None or active_flat_indices is None or nan_mask_flat is None:
-        raise ValueError("Run data is missing active bold values, indices, or NaN mask.")
-
     voxel_weights = voxel_weights.ravel()
     valid_flat_indices = np.flatnonzero(~np.asarray(nan_mask_flat, dtype=bool).ravel())
     positions = np.searchsorted(valid_flat_indices, np.asarray(active_flat_indices).ravel())
@@ -539,7 +483,7 @@ def _compute_weighted_active_bold_projection(voxel_weights, run_data):
     with np.errstate(invalid="ignore"):
         voxel_means = np.nanmean(bold_matrix, axis=1, keepdims=True)
     voxel_means = np.where(np.isfinite(voxel_means), voxel_means, 0.0)
-    bold_matrix -= voxel_means  # Demean each voxel to remove the global DC offset prior to projection
+    bold_matrix -= voxel_means
     timepoints = bold_matrix.shape[1]
     projection = np.full(timepoints, np.nan, dtype=np.float64)
 
@@ -561,7 +505,6 @@ def _resolve_trial_metric(metric):
         return np.nanmean
     if metric_key in ("median", "nanmedian"):
         return np.nanmedian
-    raise ValueError(f"Unsupported aggregation metric '{metric}'. Provide a callable or 'mean'/'median'.")
 
 def _describe_trial_metric(metric):
     if metric is None:
@@ -572,7 +515,6 @@ def _describe_trial_metric(metric):
     return getattr(metric, "__name__", "custom_metric")
 
 def _safe_pearsonr(x, y):
-    """Compute Pearson correlation while avoiding divide-by-zero warnings."""
     x = _asarray_filled(x, dtype=np.float64).ravel()
     y = _asarray_filled(y, dtype=np.float64).ravel()
     if x.size != y.size or x.size < 2:
@@ -590,14 +532,14 @@ def _safe_pearsonr(x, y):
     return float(np.dot(x, y) / denom)
 
 def _aggregate_trials(active_bold, reducer):
+    # downsample bold data by reducer metrice
     bold_trials = _asarray_filled(active_bold, dtype=np.float64)
-    if bold_trials.ndim != 3:
-        raise ValueError(f"Expected active BOLD trials with shape (voxels, trials, time); got {bold_trials.shape}.")
     num_voxels, num_trials, trial_length = bold_trials.shape
     reshaped = bold_trials.reshape(-1, trial_length)
     finite_counts = np.count_nonzero(np.isfinite(reshaped), axis=1)
     valid_mask = finite_counts > 0
     reduced_flat = np.full(reshaped.shape[0], np.nan, dtype=np.float64)
+
     if np.any(valid_mask):
         valid_values = reshaped[valid_mask]
         reduced_values = reducer(valid_values, axis=-1)
@@ -605,35 +547,27 @@ def _aggregate_trials(active_bold, reducer):
     return reduced_flat.reshape(num_voxels, num_trials)
 
 def compute_component_active_beta_correlation(voxel_weights, run_data, aggregation="median"):
+    # corr(weight * beta, bold)
     active_beta = run_data.get("active_beta")
     active_bold = run_data.get("active_bold")
+
     active_flat_indices = run_data.get("active_flat_indices")
     nan_mask_flat = run_data.get("nan_mask_flat")
-    if active_beta is None or active_bold is None:
-        raise ValueError("Run data is missing active_beta or active_bold entries required for beta correlation.")
-    if active_flat_indices is None or nan_mask_flat is None:
-        raise ValueError("Active voxel indices or NaN mask are unavailable for beta correlation.")
-
     active_flat_indices = np.asarray(active_flat_indices).ravel()
     voxel_weights = np.asarray(voxel_weights, dtype=np.float64).ravel()
     valid_flat_indices = np.flatnonzero(~np.asarray(nan_mask_flat, dtype=bool).ravel())
     positions = np.searchsorted(valid_flat_indices, active_flat_indices)
-    if np.any(positions >= valid_flat_indices.size) or not np.array_equal(valid_flat_indices[positions], active_flat_indices):
-        raise ValueError("Active voxel indices could not be mapped to voxel weight entries (beta correlation).")
 
     active_voxel_weights = voxel_weights[positions]
     beta_matrix = _asarray_filled(active_beta, dtype=np.float64)
-    if beta_matrix.ndim != 2:
-        raise ValueError(f"Active beta array must be 2D (voxels, trials); got shape {beta_matrix.shape}.")
 
     reducer = _resolve_trial_metric(aggregation)
     bold_trial_metric = _aggregate_trials(active_bold, reducer)
-    if bold_trial_metric.shape != beta_matrix.shape:
-        raise ValueError("Aggregated BOLD trials do not align with beta estimates; check preprocessing.")
 
     num_trials = beta_matrix.shape[1]
     projection = np.full(num_trials, np.nan, dtype=np.float64)
     finite_mask = np.isfinite(beta_matrix)
+
     for trial_idx in range(num_trials):
         voxel_mask = finite_mask[:, trial_idx]
         if not np.any(voxel_mask):
@@ -651,8 +585,8 @@ def compute_component_active_beta_correlation(voxel_weights, run_data, aggregati
     return projection, correlations
 
 def compute_component_active_bold_correlation(voxel_weights, run_data):
+    # corr(weight * bold, bold)
     projection, bold_matrix = _compute_weighted_active_bold_projection(voxel_weights, run_data)
-
     correlations = np.full(bold_matrix.shape[0], np.nan, dtype=np.float32)
     projection_finite = np.isfinite(projection)
     for voxel_idx, voxel_series in enumerate(bold_matrix):
@@ -665,9 +599,6 @@ def compute_component_active_bold_correlation(voxel_weights, run_data):
 
 def save_active_bold_correlation_map(correlations, active_coords, volume_shape, anat_img, file_prefix,
                                      result_prefix="active_bold_corr", title=None):
-    if correlations is None or active_coords is None or volume_shape is None or anat_img is None:
-        return {}
-
     coord_arrays = tuple(np.asarray(axis, dtype=int) for axis in active_coords)
     abs_correlations = np.abs(correlations)
     corr_path = f"{result_prefix}_{file_prefix}.npy"
@@ -696,7 +627,8 @@ def save_active_bold_correlation_map(correlations, active_coords, volume_shape, 
 
     return
 
-def plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, output_path, max_trials=15, series_label=None):
+def plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, output_path, max_trials=30, series_label=None):
+    # y = w*bold
     num_trials_total, trial_length = y_trials.shape
     num_trials = min(max_trials, num_trials_total)
     display_trials = y_trials[:num_trials]
@@ -706,8 +638,8 @@ def plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value
     #     finite_max = 1.0
     # print(f"finite_max: {finite_max}")
     # spacing = finite_max * 1.1 + 1e-3
-    spacing = 0.8
-    # spacing = np.nanmax(np.abs(display_trials - display_trials.mean(axis=1, keepdims=True)))
+    # spacing = 0.8
+    spacing = np.nanmax(np.abs(display_trials - display_trials.mean(axis=1, keepdims=True)))
     fig_height = min(14.0, max(6.0, 4.0 + num_trials * 0.05))
 
     fig, ax = plt.subplots(figsize=(9, fig_height))
@@ -732,6 +664,7 @@ def plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value
     return output_path
 
 def plot_projection_beta(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, output_path, series_label=None):
+    # y = w*beta
     y_trials = np.asarray(y_trials, dtype=np.float64).ravel()
     num_trials = y_trials.size
     time_axis = np.arange(num_trials)
@@ -762,7 +695,7 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
     # plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, plot_path, series_label="PC space")
 
     bold_projection_signal, _ = _compute_weighted_active_bold_projection(voxel_weights, run_data)
-    np.save(f"y_projection_{file_prefix}.npy", bold_projection_signal)
+    # np.save(f"y_projection_{file_prefix}.npy", bold_projection_signal)
     _, y_trials = _reshape_projection(bold_projection_signal, trial_length)
     plot_path = f"y_projection_trials_{file_prefix}.png"
     plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, plot_path, series_label="Active BOLD space")
@@ -771,7 +704,7 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
     beta_matrix = np.nan_to_num(beta_volume_clean, nan=0.0, posinf=0.0, neginf=0.0)
     y_projection_voxel_trials = voxel_weights @ beta_matrix
     y_projection_voxel = y_projection_voxel_trials.ravel()
-    np.save(f"y_projection_voxel_{file_prefix}.npy", y_projection_voxel)
+    # np.save(f"y_projection_voxel_{file_prefix}.npy", y_projection_voxel)
     plot_path = f"y_projection_trials_voxel_{file_prefix}.png"
     plot_projection_beta(y_projection_voxel, task_alpha, bold_alpha, beta_alpha, rho_value, plot_path, series_label="Voxel space")
     return 
@@ -780,10 +713,16 @@ ridge_penalty = 1e-6
 solver_name = "MOSEK"
 soc_ratio = 0.95
 
-alpha_sweep = [{"task_penalty": 0.5, "bold_penalty": 0.25, "beta_penalty": 50}]
+# task_penalty_sweep = [0.0, 0.5, 100.0]
+# bold_penalty_sweep = [0.0, 0.25, 100.0]
+task_penalty_sweep = [0.0]
+bold_penalty_sweep = [0.0]
+beta_penalty_sweep = [50.0, 500.0]
+alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha}
+    for task_alpha, bold_alpha, beta_alpha in product(task_penalty_sweep, bold_penalty_sweep, beta_penalty_sweep)]
 rho_sweep = [0.2, 0.5, 0.95]
 bootstrap_iterations = 1000
-trial_downsample_metric = "mean"  # Change to "median" or provide a callable to adjust trial-level aggregation.
+trial_downsample_metric = "median"
 
 def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
     train_data = prepare_data_func(run_train, bold_data_train, beta_glm, beta_volume_filter_train,
@@ -811,7 +750,7 @@ def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
             voxel_weights = coeff_pinv.T @ component_weights
             # print(f"voxel_weights shape: {voxel_weights.shape}, component_weights shape: {component_weights.shape}")
 
-            file_prefix = f"sub{sub}_ses{ses}_trainrun{run_train}_testrun{run_test}_{sweep_suffix}"
+            file_prefix = f"sub{sub}_ses{ses}_{sweep_suffix}"
             # np.save(f"behavior_weights_{file_prefix}.npy", pca_weights)
             # np.save(f"behavior_weights_pca_{file_prefix}.npy", weights)
             # view_path = save_weight_outputs(anat_img, train_data["active_coords"], pca_weights, file_prefix)
@@ -820,44 +759,21 @@ def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
             beta_volume_clean_finite = np.nan_to_num(beta_volume_clean, nan=0.0, posinf=0.0, neginf=0.0)
             weighted_voxel_activity = voxel_weights[:, None] * beta_volume_clean_finite
             weighted_beta_path = f"beta_weighted_activity_{file_prefix}.npy"
-            np.save(weighted_beta_path, weighted_voxel_activity.astype(np.float32))
+            # np.save(weighted_beta_path, weighted_voxel_activity.astype(np.float32))
 
-            try:
-                projection_signal, voxel_correlations = compute_component_active_bold_correlation(voxel_weights, train_data)
-            except ValueError as exc:
-                projection_signal, voxel_correlations = None, None
-                # print(f"Skipping active BOLD correlation computation: {exc}", flush=True)
+            projection_signal, voxel_correlations = compute_component_active_bold_correlation(voxel_weights, train_data) 
+            # np.save(f"component_active_bold_projection_{file_prefix}.npy", projection_signal)
 
-            if projection_signal is not None and np.any(np.isfinite(projection_signal)):
-                projection_path = f"component_active_bold_projection_{file_prefix}.npy"
-                np.save(projection_path, projection_signal.astype(np.float32))
-
-            if voxel_correlations is not None:
-                save_active_bold_correlation_map(voxel_correlations,
-                    train_data.get("active_coords"), beta_volume_filter_train.shape[:3], anat_img, file_prefix)
+            save_active_bold_correlation_map(voxel_correlations, train_data.get("active_coords"), beta_volume_filter_train.shape[:3], anat_img, file_prefix)
 
             beta_projection_signal = None
             beta_voxel_correlations = None
-            try:
-                beta_projection_signal, beta_voxel_correlations = compute_component_active_beta_correlation(
-                    voxel_weights, train_data, aggregation=trial_downsample_metric)
-            except ValueError as exc:
-                print(f"Skipping active beta correlation computation: {exc}", flush=True)
-
-            if beta_projection_signal is not None and np.any(np.isfinite(beta_projection_signal)):
-                beta_projection_path = f"component_active_beta_projection_{metric_label}_{file_prefix}.npy"
-                np.save(beta_projection_path, beta_projection_signal.astype(np.float32))
-
-            if beta_voxel_correlations is not None:
-                save_active_bold_correlation_map(
-                    beta_voxel_correlations,
-                    train_data.get("active_coords"),
-                    beta_volume_filter_train.shape[:3],
-                    anat_img,
-                    file_prefix,
-                    result_prefix=f"active_beta_corr_{metric_label}",
-                    title=f"corr(component_weights@active_beta, aggregated_active_bold[{metric_label}])",
-                )
+            beta_projection_signal, beta_voxel_correlations = compute_component_active_beta_correlation(voxel_weights, train_data, aggregation=trial_downsample_metric)
+            # np.save(f"component_active_beta_projection_{metric_label}_{file_prefix}.npy", beta_projection_signal)
+            save_active_bold_correlation_map(beta_voxel_correlations, train_data.get("active_coords"),
+                                             beta_volume_filter_train.shape[:3], anat_img, file_prefix,
+                                             result_prefix=f"active_beta_corr_{metric_label}",
+                                             title=f"corr(component_weights@active_beta, aggregated_active_bold[{metric_label}])")
 
             save_projection_outputs(component_weights, bold_pca_components, trial_len, file_prefix, 
                                     task_alpha, bold_alpha, beta_alpha, rho_value,
@@ -875,8 +791,7 @@ def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
 
             if bootstrap_samples > 0:
                 # print(f"  Running weight-shuffle analysis with {bootstrap_samples} samples...", flush=True)
-                shuffle_results = perform_weight_shuffle_tests(
-                    train_data, test_data, component_weights, task_alpha, bold_alpha, beta_alpha, rho_value, num_samples=bootstrap_samples)
+                shuffle_results = perform_weight_shuffle_tests(train_data, test_data, component_weights, task_alpha, bold_alpha, beta_alpha, rho_value, num_samples=bootstrap_samples)
 
                 succeeded = shuffle_results["num_successful"]
                 requested = shuffle_results["num_requested"]
@@ -919,15 +834,13 @@ def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
                     summary = shuffle_results["penalties"].get(label, {})
                     p_value = summary.get("p_value", np.nan)
 
-                    penalty_plot_path = f"bootstrap_distribution_{file_prefix}_penalty_{label}.png"
-                    created_path = plot_bootstrap_distribution(samples, actual_value, p_value, f"{label.capitalize()} penalty bootstrap", "Penalty value", penalty_plot_path)
+                    # penalty_plot_path = f"bootstrap_distribution_{file_prefix}_penalty_{label}.png"
+                    # created_path = plot_bootstrap_distribution(samples, actual_value, p_value, f"{label.capitalize()} penalty bootstrap", "Penalty value", penalty_plot_path)
 
                 correlation_actuals = {"train": float(train_metrics["pearson"]) if np.isfinite(train_metrics["pearson"]) else np.nan,
                                        "test": float(test_metrics["pearson"]) if np.isfinite(test_metrics["pearson"]) else np.nan}
 
                 for split, samples in correlation_samples.items():
-                    if samples is None or samples.size == 0:
-                        continue
                     actual_value = correlation_actuals.get(split, np.nan)
                     summary = shuffle_results["correlation"].get(split, {})
                     p_value = summary.get("p_value", np.nan)
@@ -947,38 +860,47 @@ def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
 
 
 if __name__ == "__main__":
-    run_cross_run_experiment(alpha_sweep, rho_sweep, bootstrap_samples=bootstrap_iterations)
+    parser = argparse.ArgumentParser(description="Run a subset of alpha/rho sweeps.")
+    parser.add_argument("--alpha-idx", type=int, default=None,
+                        help="0-based index into alpha_sweep; omit to iterate over all alphas.")
+    parser.add_argument("--rho-idx", type=int, default=None,
+                        help="0-based index into rho_sweep; omit to iterate over all rhos.")
+    parser.add_argument("--combo-idx", type=int, default=None,
+                        help="Single 0-based index over alpha×rho combinations (overrides --alpha-idx/--rho-idx).")
+    args = parser.parse_args()
 
-# if __name__ == "__main__":
-#     parser = argparse.ArgumentParser(description="Run a subset of alpha/rho sweeps.")
-#     parser.add_argument("--alpha-idx", type=int, default=None,
-#                         help="0-based index into alpha_sweep; omit to run all.")
-#     parser.add_argument("--rho-idx", type=int, default=None,
-#                         help="0-based index into rho_sweep; omit to run all.")
-#     parser.add_argument("--combo-idx", type=int, default=None,
-#                         help="Single 0-based index over alpha×rho combinations.")
-#     args = parser.parse_args()
+    combo_idx = args.combo_idx
+    if combo_idx is None:
+        env_combo = os.environ.get("SLURM_ARRAY_TASK_ID")
+        if env_combo is not None:
+            try:
+                combo_idx = int(env_combo)
+            except ValueError as exc:
+                raise ValueError("SLURM_ARRAY_TASK_ID must be an integer when provided.") from exc
 
-#     selected_alphas = alpha_sweep
-#     selected_rhos = rho_sweep
+    selected_alphas = alpha_sweep
+    selected_rhos = rho_sweep
 
-#     if args.combo_idx is not None:
-#         total = len(alpha_sweep) * len(rho_sweep)
-#         if not 0 <= args.combo_idx < total:
-#             raise ValueError(f"combo_idx must be in [0, {total})")
-#         alpha_idx, rho_idx = divmod(args.combo_idx, len(rho_sweep))
-#         selected_alphas = [alpha_sweep[alpha_idx]]
-#         selected_rhos = [rho_sweep[rho_idx]]
-#     else:
-#         if args.alpha_idx is not None:
-#             if not 0 <= args.alpha_idx < len(alpha_sweep):
-#                 raise ValueError("alpha_idx out of range")
-#             selected_alphas = [alpha_sweep[args.alpha_idx]]
-#         if args.rho_idx is not None:
-#             if not 0 <= args.rho_idx < len(rho_sweep):
-#                 raise ValueError("rho_idx out of range")
-#             selected_rhos = [rho_sweep[args.rho_idx]]
+    if combo_idx is not None:
+        total = len(alpha_sweep) * len(rho_sweep)
+        if not 0 <= combo_idx < total:
+            raise ValueError(f"combo_idx must be in [0, {total})")
+        alpha_idx, rho_idx = divmod(combo_idx, len(rho_sweep))
+        selected_alphas = [alpha_sweep[alpha_idx]]
+        selected_rhos = [rho_sweep[rho_idx]]
+        print(f"Running combo_idx={combo_idx} (alpha_idx={alpha_idx}, rho_idx={rho_idx})", flush=True)
+    else:
+        if args.alpha_idx is not None:
+            if not 0 <= args.alpha_idx < len(alpha_sweep):
+                raise ValueError("alpha_idx out of range")
+            selected_alphas = [alpha_sweep[args.alpha_idx]]
+            print(f"Running alpha_idx={args.alpha_idx}", flush=True)
+        if args.rho_idx is not None:
+            if not 0 <= args.rho_idx < len(rho_sweep):
+                raise ValueError("rho_idx out of range")
+            selected_rhos = [rho_sweep[args.rho_idx]]
+            print(f"Running rho_idx={args.rho_idx}", flush=True)
 
-#     run_cross_run_experiment(selected_alphas, selected_rhos, bootstrap_samples=bootstrap_iterations)
+    run_cross_run_experiment(selected_alphas, selected_rhos, bootstrap_samples=bootstrap_iterations)
 
 # %%

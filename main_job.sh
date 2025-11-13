@@ -1,14 +1,15 @@
 #!/bin/bash
 #SBATCH --job-name=fmri_bigmem
+#SBATCH --array=0-80
 #SBATCH --account=st-mmckeown-1
 #SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=256G
-#SBATCH --output=slurm-%j.out
-#SBATCH --error=slurm-%j.err
-#SBATCH --mail-user=zkavian@ead.ubc.ca
+#SBATCH --output=slurm-%A_%a.out
+#SBATCH --error=slurm-%A_%a.err
+#SBATCH --mail-user=zkavian@student.ubc.ca
 #SBATCH --mail-type=END,FAIL
 
 module purge
@@ -19,5 +20,5 @@ export HOME=/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis
 source /scratch/st-mmckeown-1/zkavian/fmri_models/myenv/bin/activate
 cd /scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/
 
-python main_bootstrap.py
+python main_bootstrap.py --combo-idx "${SLURM_ARRAY_TASK_ID}"
 # python matrix_diagnostics.py
