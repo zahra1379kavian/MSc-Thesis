@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=fmri_bigmem
+#SBATCH --job-name=fmri_opt
 #SBATCH --account=st-mmckeown-1
 #SBATCH --time=48:00:00
 #SBATCH --nodes=1
@@ -8,15 +8,15 @@
 #SBATCH --mem=256G
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
-#SBATCH --mail-user=zkavian@ead.ubc.ca
+#SBATCH --mail-user=zkavian@student.ubc.ca
 #SBATCH --mail-type=END,FAIL
 
 module purge
 module load intel-oneapi-compilers/2023.1.0
 module load python/3.11
 
-export HOME=/scratch/st-mmckeown-1/zkavian/fmri_models/
+export HOME=/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis
 source /scratch/st-mmckeown-1/zkavian/fmri_models/myenv/bin/activate
-cd /scratch/st-mmckeown-1/zkavian/fmri_models/
+cd /scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/
 
-python ablation_study_cross_run.py
+python main_bootstrap.py

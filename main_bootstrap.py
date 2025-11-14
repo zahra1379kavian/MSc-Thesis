@@ -1,3 +1,4 @@
+# Train on Run 1, test on Run 2
 import argparse
 import os
 from itertools import product
@@ -379,14 +380,17 @@ def perform_weight_shuffle_tests(train_data, test_data, weights, task_alpha, bol
     test_corr_samples = []
     train_corr_samples = []
 
-    abs_weights = np.abs(weights)
-    fallback_scale = np.max(abs_weights) * 1e-2
-    if not np.isfinite(fallback_scale) or fallback_scale <= 0:
-        fallback_scale = 1e-8
-    noise_scale = np.maximum(abs_weights, fallback_scale)
+    weights_std = float(np.std(weights))
+    if not np.isfinite(weights_std) or weights_std < 0:
+        weights_std = 0.0
+    noise_std = weights_std * 0.1
+    if not np.isfinite(noise_std) or noise_std <= 0:
+        noise_std = 1e-8
 
+    print(f"Noise Dist, mean: {np.mean(weights)}, std: {noise_std}")
     for iteration in range(num_samples):
-        noise = rng.normal(loc=0.0, scale=noise_scale, size=weights.shape)
+        # noise = rng.normal(loc=np.mean(weights), scale=noise_std, size=weights.shape)
+        noise = rng.normal(loc=0, scale=noise_std, size=weights.shape)
         noisy_weights = weights + noise
         noisy_weights = np.abs(noisy_weights)
         sum_noisy = np.sum(noisy_weights)
@@ -597,68 +601,65 @@ def compute_component_active_bold_correlation(voxel_weights, run_data):
         correlations[voxel_idx] = _safe_pearsonr(projection[joint_mask], voxel_series[joint_mask])
     return projection, correlations
 
-def save_active_bold_correlation_map(correlations, active_coords, volume_shape, anat_img, file_prefix,
-                                     result_prefix="active_bold_corr", title=None):
+def save_active_bold_correlation_map(correlations, active_coords, volume_shape, anat_img, file_prefix, result_prefix="active_bold_corr"):
     coord_arrays = tuple(np.asarray(axis, dtype=int) for axis in active_coords)
-    abs_correlations = np.abs(correlations)
+    values = np.asarray(correlations, dtype=np.float64).ravel()
+    display_values = np.abs(values)
     corr_path = f"{result_prefix}_{file_prefix}.npy"
     # np.save(corr_path, correlations.astype(np.float32))
 
     volume = np.full(volume_shape, np.nan, dtype=np.float32)
     colorbar_max = None
     if coord_arrays and coord_arrays[0].size:
-        volume[coord_arrays] = abs_correlations
-        finite_abs_corr = abs_correlations[np.isfinite(abs_correlations)]
-        if finite_abs_corr.size:
-            colorbar_max = float(np.percentile(finite_abs_corr, 95))
+        volume[coord_arrays] = display_values
+        finite_values = display_values[np.isfinite(display_values)]
+        colorbar_max = float(np.percentile(finite_values, 95))
 
     corr_img = nib.Nifti1Image(volume, anat_img.affine, anat_img.header)
     volume_path = f"{result_prefix}_{file_prefix}.nii.gz"
     nib.save(corr_img, volume_path)
 
-    if np.any(np.isfinite(correlations)):
+    if np.any(np.isfinite(display_values)):
         display_volume = np.nan_to_num(volume, nan=0.0, posinf=0.0, neginf=0.0)
-        if colorbar_max is not None and colorbar_max > 0:
-            display_volume = np.clip(display_volume, 0.0, colorbar_max)
+        display_volume = np.clip(display_volume, 0.0, colorbar_max)
         display_img = nib.Nifti1Image(display_volume, anat_img.affine, anat_img.header)
-        display = plotting.view_img(display_img, bg_img=anat_img, colorbar=True, symmetric_cmap=False, cmap='jet',
-            title=title or "corr(component_weights@active_bold, active_bold)", vmax=colorbar_max)
+        display = plotting.view_img(display_img, bg_img=anat_img, colorbar=True, symmetric_cmap= False, cmap='jet')
         display.save_as_html(f"{result_prefix}_{file_prefix}.html")
 
     return
 
-def plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, output_path, max_trials=30, series_label=None):
-    # y = w*bold
+def plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, output_path, max_trials=10, series_label=None):
     num_trials_total, trial_length = y_trials.shape
-    num_trials = min(max_trials, num_trials_total)
-    display_trials = y_trials[:num_trials]
     time_axis = np.arange(trial_length)
-    # finite_max = np.nanmax(np.abs(display_trials)) if np.any(np.isfinite(display_trials)) else 1.0
-    # if not np.isfinite(finite_max) or finite_max <= 0:
-    #     finite_max = 1.0
-    # print(f"finite_max: {finite_max}")
-    # spacing = finite_max * 1.1 + 1e-3
-    # spacing = 0.8
-    spacing = np.nanmax(np.abs(display_trials - display_trials.mean(axis=1, keepdims=True)))
-    fig_height = min(14.0, max(6.0, 4.0 + num_trials * 0.05))
+    fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
+    trial_windows = [(10, 20), (40, 50)]
+    window_titles = ["Trials 10-20", "Trials 40-50"]
 
-    fig, ax = plt.subplots(figsize=(9, fig_height))
-    for idx, trial_values in enumerate(display_trials):
-        offset = idx * spacing
-        ax.plot(time_axis, trial_values + offset, linewidth=0.8, alpha=0.9, color="#1f77b4")
+    def _get_light_colors(count):
+        cmap = plt.cm.get_cmap("tab20", count)
+        raw_colors = cmap(np.linspace(0, 1, count))
+        pastel = raw_colors * 0.55 + 0.45
+        return np.clip(pastel, 0.0, 1.0)
 
-    ax.set_xlabel("Time point")
-    ax.set_ylabel("Trial index (offset)")
-    subtitle = ""
-    if num_trials_total > num_trials:
-        subtitle = f" (showing first {num_trials} / {num_trials_total})"
-    ax.set_xlim(time_axis[0], time_axis[-1])
-    y_ticks = np.arange(num_trials) * spacing
-    ax.set_yticks(y_ticks)
-    ax.set_yticklabels([str(i + 1) for i in range(num_trials)])
+    for ax, (start, end), window_title in zip(axes, trial_windows, window_titles):
+        start_idx = min(start, num_trials_total)
+        end_idx = min(end, num_trials_total)
+        window_trials = y_trials[start_idx:end_idx]
+        trials_to_plot = window_trials[:max_trials]
+        colors = _get_light_colors(trials_to_plot.shape[0])
+        for trial_offset, (trial_values, color) in enumerate(zip(trials_to_plot, colors)):
+            label = f"Trial {start_idx + trial_offset + 1}"
+            ax.plot(time_axis, trial_values, linewidth=1.0, color=color, alpha=0.9, label=label)
+
+        ax.set_ylabel("BOLD projection")
+        ax.set_title(window_title)
+        ax.grid(True, linestyle="--", alpha=0.25)
+        ax.legend(loc="upper right", fontsize=8, ncol=2)
+
+    axes[-1].set_xlabel("Time point")
     label_suffix = f" [{series_label}]" if series_label else ""
-    ax.set_title(f"y | alpha_task={task_alpha:g}, alpha_bold={bold_alpha:g}, alpha_beta={beta_alpha:g}, rho={rho_value:g}{subtitle}{label_suffix}")
-    fig.tight_layout()
+    fig.suptitle(f"y | alpha_task={task_alpha:g}, alpha_bold={bold_alpha:g}, alpha_beta={beta_alpha:g}, rho={rho_value:g}{label_suffix}",fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(output_path, dpi=300)
     plt.close(fig)
     return output_path
@@ -678,6 +679,33 @@ def plot_projection_beta(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value
     label_suffix = f" [{series_label}]" if series_label else ""
     ax.set_title(f"y_beta | alpha_task={task_alpha:g}, alpha_bold={bold_alpha:g}, alpha_beta={beta_alpha:g}, rho={rho_value:g}{label_suffix}")
     ax.grid(True, linestyle="--", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+    return output_path
+
+def plot_projection_beta_sweep(rho_projection_series, task_alpha, bold_alpha, beta_alpha, output_path, series_label=None):
+    if not rho_projection_series:
+        return None
+    sorted_series = sorted(rho_projection_series, key=lambda item: item[0])
+    max_trials = max(np.asarray(series, dtype=np.float64).ravel().size for _, series in sorted_series)
+    fig_height = 5.0 if max_trials <= 120 else 6.5
+    time_axis = np.arange(max_trials)
+    cmap = plt.cm.get_cmap("tab10", len(sorted_series))
+
+    fig, ax = plt.subplots(figsize=(10, fig_height))
+    for idx, (rho_value, projection) in enumerate(sorted_series):
+        y_trials = np.asarray(projection, dtype=np.float64).ravel()
+        trial_axis = time_axis[: y_trials.size]
+        ax.plot(trial_axis, y_trials, linewidth=1.2, alpha=0.9, label=f"rho={rho_value:g}", color=cmap(idx))
+
+    ax.set_xlabel("Trial index")
+    ax.set_ylabel("Voxel-space projection")
+    label_suffix = f" [{series_label}]" if series_label else ""
+    rho_labels = ", ".join(f"{rho:g}" for rho, _ in sorted_series)
+    ax.set_title(f"y_beta across rhos ({rho_labels}) | alpha_task={task_alpha:g}, alpha_bold={bold_alpha:g}, alpha_beta={beta_alpha:g}{label_suffix}")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.legend(loc="best", fontsize=9, ncol=2)
     fig.tight_layout()
     fig.savefig(output_path, dpi=300)
     plt.close(fig)
@@ -705,9 +733,7 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
     y_projection_voxel_trials = voxel_weights @ beta_matrix
     y_projection_voxel = y_projection_voxel_trials.ravel()
     # np.save(f"y_projection_voxel_{file_prefix}.npy", y_projection_voxel)
-    plot_path = f"y_projection_trials_voxel_{file_prefix}.png"
-    plot_projection_beta(y_projection_voxel, task_alpha, bold_alpha, beta_alpha, rho_value, plot_path, series_label="Voxel space")
-    return 
+    return y_projection_voxel
 # %%
 ridge_penalty = 1e-6
 solver_name = "MOSEK"
@@ -715,12 +741,14 @@ soc_ratio = 0.95
 
 # task_penalty_sweep = [0.0, 0.5, 100.0]
 # bold_penalty_sweep = [0.0, 0.25, 100.0]
-task_penalty_sweep = [0.0]
-bold_penalty_sweep = [0.0]
-beta_penalty_sweep = [50.0, 500.0]
+# beta_penalty_sweep = [0, 50.0, 500.0]
+task_penalty_sweep = [0.5]
+bold_penalty_sweep = [0.25]
+beta_penalty_sweep = [50]
 alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha}
     for task_alpha, bold_alpha, beta_alpha in product(task_penalty_sweep, bold_penalty_sweep, beta_penalty_sweep)]
-rho_sweep = [0.2, 0.5, 0.95]
+# rho_sweep = [0.2, 0.6, 0.8]
+rho_sweep = [0.6]
 bootstrap_iterations = 1000
 trial_downsample_metric = "median"
 
@@ -739,6 +767,8 @@ def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
         task_alpha = alpha_setting["task_penalty"]
         bold_alpha = alpha_setting["bold_penalty"]
         beta_alpha = alpha_setting["beta_penalty"]
+        rho_projection_series = []
+        alpha_prefix = f"sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}"
 
         for rho_value in rho_values:
             sweep_suffix = f"task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_rho{rho_value:g}"
@@ -748,9 +778,12 @@ def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
             component_weights = np.abs(solution["weights"])
             coeff_pinv = np.asarray(train_data["coeff_pinv"])
             voxel_weights = coeff_pinv.T @ component_weights
+            viz_weights = voxel_weights * 1e4
             # print(f"voxel_weights shape: {voxel_weights.shape}, component_weights shape: {component_weights.shape}")
-
             file_prefix = f"sub{sub}_ses{ses}_{sweep_suffix}"
+            save_active_bold_correlation_map(viz_weights, train_data.get("active_coords"), beta_volume_filter_train.shape[:3], anat_img,
+                                             file_prefix, result_prefix="voxel_weights")
+
             # np.save(f"behavior_weights_{file_prefix}.npy", pca_weights)
             # np.save(f"behavior_weights_pca_{file_prefix}.npy", weights)
             # view_path = save_weight_outputs(anat_img, train_data["active_coords"], pca_weights, file_prefix)
@@ -772,13 +805,13 @@ def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
             # np.save(f"component_active_beta_projection_{metric_label}_{file_prefix}.npy", beta_projection_signal)
             save_active_bold_correlation_map(beta_voxel_correlations, train_data.get("active_coords"),
                                              beta_volume_filter_train.shape[:3], anat_img, file_prefix,
-                                             result_prefix=f"active_beta_corr_{metric_label}",
-                                             title=f"corr(component_weights@active_beta, aggregated_active_bold[{metric_label}])")
+                                             result_prefix=f"active_beta_corr_{metric_label}")
 
-            save_projection_outputs(component_weights, bold_pca_components, trial_len, file_prefix, 
-                                    task_alpha, bold_alpha, beta_alpha, rho_value,
-                                    voxel_weights=voxel_weights, beta_volume_clean=beta_volume_clean,
-                                    run_data=train_data, bold_projection=projection_signal)
+            y_projection_voxel = save_projection_outputs(component_weights, bold_pca_components, trial_len, file_prefix, 
+                                                         task_alpha, bold_alpha, beta_alpha, rho_value,
+                                                         voxel_weights=voxel_weights, beta_volume_clean=beta_volume_clean,
+                                                         run_data=train_data, bold_projection=projection_signal)
+            rho_projection_series.append((rho_value, y_projection_voxel))
 
             train_metrics = evaluate_projection(train_data, component_weights)
             test_metrics = evaluate_projection(test_data, component_weights)
@@ -857,6 +890,10 @@ def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
                     created_path = plot_bootstrap_distribution(total_samples, solution["total_loss"], p_value, "Total loss weight shuffle", "Total loss", total_plot_path)
                     # if created_path:
                         # print(f"    Saved total loss shuffle plot to {created_path}", flush=True)
+
+        if rho_projection_series:
+            aggregate_plot_path = f"y_projection_trials_voxel_{alpha_prefix}_all_rhos.png"
+            plot_projection_beta_sweep(rho_projection_series, task_alpha, bold_alpha, beta_alpha, aggregate_plot_path, series_label="Voxel space")
 
 
 if __name__ == "__main__":
