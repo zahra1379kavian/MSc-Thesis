@@ -6,7 +6,7 @@ from scipy.stats import ttest_1samp
 from statsmodels.stats.multitest import multipletests
 import scipy.sparse as sp
 import scipy.ndimage as ndimage
-
+from empca.empca.empca import empca
 
 # %%
 ses = 1
@@ -138,54 +138,54 @@ print(5, flush=True)
 # apply filter
 
 # # %%
-def hampel_filter_image(image, window_size, threshold_factor, return_stats=False):
-    footprint = np.ones((window_size,) * 3, dtype=bool)
-    insufficient_any = np.zeros(image.shape[:3], dtype=bool)
-    corrected_any = np.zeros(image.shape[:3], dtype=bool)
+# def hampel_filter_image(image, window_size, threshold_factor, return_stats=False):
+#     footprint = np.ones((window_size,) * 3, dtype=bool)
+#     insufficient_any = np.zeros(image.shape[:3], dtype=bool)
+#     corrected_any = np.zeros(image.shape[:3], dtype=bool)
 
-    for t in range(image.shape[3]):
-        print(f"Trial Number: {t}", flush=True)
-        vol = image[..., t]
-        valid = np.isfinite(vol)
+#     for t in range(image.shape[3]):
+#         print(f"Trial Number: {t}", flush=True)
+#         vol = image[..., t]
+#         valid = np.isfinite(vol)
 
-        med = ndimage.generic_filter(vol, np.nanmedian, footprint=footprint, mode='constant', cval=np.nan).astype(np.float32)
-        mad = ndimage.generic_filter(np.abs(vol - med), np.nanmedian, footprint=footprint, mode='constant', cval=np.nan).astype(np.float32)
-        counts = ndimage.generic_filter(np.isfinite(vol).astype(np.float32), np.sum, footprint=footprint, mode='constant', cval=0).astype(np.float32)
-        neighbor_count = counts - valid.astype(np.float32)
+#         med = ndimage.generic_filter(vol, np.nanmedian, footprint=footprint, mode='constant', cval=np.nan).astype(np.float32)
+#         mad = ndimage.generic_filter(np.abs(vol - med), np.nanmedian, footprint=footprint, mode='constant', cval=np.nan).astype(np.float32)
+#         counts = ndimage.generic_filter(np.isfinite(vol).astype(np.float32), np.sum, footprint=footprint, mode='constant', cval=0).astype(np.float32)
+#         neighbor_count = counts - valid.astype(np.float32)
 
-        scaled_mad = 1.4826 * mad
-        insufficient = valid & (neighbor_count < 3)
-        insufficient_any |= insufficient
-        image[..., t][insufficient] = np.nan
+#         scaled_mad = 1.4826 * mad
+#         insufficient = valid & (neighbor_count < 3)
+#         insufficient_any |= insufficient
+#         image[..., t][insufficient] = np.nan
 
-        enough_data = (neighbor_count >= 3) & valid
-        outliers = enough_data & (np.abs(vol - med) > threshold_factor * scaled_mad)
+#         enough_data = (neighbor_count >= 3) & valid
+#         outliers = enough_data & (np.abs(vol - med) > threshold_factor * scaled_mad)
 
-        corrected_any |= outliers
-        image[..., t][outliers] = med[outliers]
+#         corrected_any |= outliers
+#         image[..., t][outliers] = med[outliers]
 
-    if return_stats:
-        stats = {
-            'insufficient_total': int(np.count_nonzero(insufficient_any)),
-            'corrected_total': int(np.count_nonzero(corrected_any)),
-        }
-        return image, stats
+#     if return_stats:
+#         stats = {
+#             'insufficient_total': int(np.count_nonzero(insufficient_any)),
+#             'corrected_total': int(np.count_nonzero(corrected_any)),
+#         }
+#         return image, stats
 
-    return image
+#     return image
 
-beta_volume_filter, hampel_stats = hampel_filter_image(clean_active_volume.astype(np.float32), window_size=5, threshold_factor=3, return_stats=True)
-# print('Insufficient neighbours per frame:', hampel_stats['insufficient_counts'], flush=True)
-print('Total voxels with <3 neighbours:', hampel_stats['insufficient_total'], flush=True)
-print('Total corrected voxels:', hampel_stats['corrected_total'], flush=True)
+# beta_volume_filter, hampel_stats = hampel_filter_image(clean_active_volume.astype(np.float32), window_size=5, threshold_factor=3, return_stats=True)
+# # print('Insufficient neighbours per frame:', hampel_stats['insufficient_counts'], flush=True)
+# print('Total voxels with <3 neighbours:', hampel_stats['insufficient_total'], flush=True)
+# print('Total corrected voxels:', hampel_stats['corrected_total'], flush=True)
 
-# beta_volume_filter = beta_volume_filter[~np.all(np.isnan(beta_volume_filter), axis=-1)]
+# # beta_volume_filter = beta_volume_filter[~np.all(np.isnan(beta_volume_filter), axis=-1)]
+# # np.save(f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy', beta_volume_filter)
+
+# nan_voxels = np.all(np.isnan(beta_volume_filter), axis=-1) 
+# mask_2d = nan_voxels.reshape(-1) 
+
 # np.save(f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy', beta_volume_filter)
-
-nan_voxels = np.all(np.isnan(beta_volume_filter), axis=-1) 
-mask_2d = nan_voxels.reshape(-1) 
-
-np.save(f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy', beta_volume_filter)
-np.save(f'mask_all_nan_sub{sub}_ses{ses}_run{run}.npy', mask_2d)
+# np.save(f'mask_all_nan_sub{sub}_ses{ses}_run{run}.npy', mask_2d)
 
 ######################################################################################################################
 ######################################################################################################################
@@ -213,3 +213,7 @@ np.save(f"active_coords_sub{sub}_ses{ses}_run{run}.npy", active_coords)
 # active_flat_idx = np.ravel_multi_index(active_coords, clean_active_volume.shape[:3])
 # active_keep_mask = ~mask_2d[active_flat_idx]
 # clean_active_bold = clean_active_bold[active_keep_mask]
+
+######################################################################################################################
+######################################################################################################################
+######################################################################################################################

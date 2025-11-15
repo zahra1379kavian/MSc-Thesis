@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=fmri_bigmem
-#SBATCH --array=0-80
+#SBATCH --array=0-20
 #SBATCH --account=st-mmckeown-1
 #SBATCH --time=48:00:00
 #SBATCH --nodes=1

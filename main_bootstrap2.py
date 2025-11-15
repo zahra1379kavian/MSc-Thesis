@@ -6,6 +6,7 @@ from os.path import join
 from empca.empca.empca import empca
 import cvxpy as cp
 import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import nibabel as nib
 import numpy as np
@@ -14,8 +15,6 @@ from scipy.io import loadmat
 from scipy.stats import ttest_1samp
 from statsmodels.stats.multitest import multipletests
 
-matplotlib.use("Agg")
-
 
 # %%
 def _asarray_filled(data, dtype=np.float32):
@@ -23,10 +22,77 @@ def _asarray_filled(data, dtype=np.float32):
         data = data.filled(np.nan)
     return np.asarray(data, dtype=dtype)
 
+def synchronize_beta_voxels(beta_run1, beta_run2, mask_run1, mask_run2):
+    mask_run1 = mask_run1.ravel()
+    mask_run2 = mask_run2.ravel()
+    valid_run1 = ~mask_run1
+    valid_run2 = ~mask_run2
+    shared_valid = valid_run1 & valid_run2
+
+    run1_indices = np.flatnonzero(valid_run1)
+    run2_indices = np.flatnonzero(valid_run2)
+    shared_mask_run1 = shared_valid[run1_indices]
+    shared_mask_run2 = shared_valid[run2_indices]
+
+    synced_run1 = beta_run1[shared_mask_run1]
+    synced_run2 = beta_run2[shared_mask_run2]
+    removed_run1 = beta_run1.shape[0] - synced_run1.shape[0]
+    removed_run2 = beta_run2.shape[0] - synced_run2.shape[0]
+    if removed_run1 > 0 or removed_run2 > 0:
+        print(f"Removed {removed_run1} run1 voxels and {removed_run2} run2 voxels to enforce a shared voxel set.",
+            flush=True)
+
+    shared_flat_indices = np.flatnonzero(shared_valid)
+
+    combined_nan_mask = mask_run1 | mask_run2
+    return synced_run1, synced_run2, combined_nan_mask, shared_flat_indices
+
+def combine_active_run_data(coords_run1, coords_run2, bold_run1, bold_run2, volume_shape, invalid_flat_mask=None):
+    coords_run1 = tuple(np.asarray(axis, dtype=np.int64) for axis in coords_run1)
+    coords_run2 = tuple(np.asarray(axis, dtype=np.int64) for axis in coords_run2)
+
+    flat_run1 = np.ravel_multi_index(coords_run1, volume_shape)
+    flat_run2 = np.ravel_multi_index(coords_run2, volume_shape)
+    shared_flat = np.intersect1d(flat_run1, flat_run2, assume_unique=False)
+    if invalid_flat_mask is not None:
+        invalid_flat_mask = invalid_flat_mask.ravel()
+        shared_flat = shared_flat[~invalid_flat_mask[shared_flat]]
+
+    shared_coords = np.unravel_index(shared_flat, volume_shape)
+    shared_coords = tuple(np.asarray(axis, dtype=np.int64) for axis in shared_coords)
+
+    sorter1 = np.argsort(flat_run1)
+    sorter2 = np.argsort(flat_run2)
+    sorted_flat_run1 = flat_run1[sorter1]
+    sorted_flat_run2 = flat_run2[sorter2]
+    idx_run1 = sorter1[np.searchsorted(sorted_flat_run1, shared_flat)]
+    idx_run2 = sorter2[np.searchsorted(sorted_flat_run2, shared_flat)]
+    combined_bold = np.concatenate((bold_run1[idx_run1], bold_run2[idx_run2]), axis=1)
+
+    return shared_flat, shared_coords, combined_bold
+
+def combine_filtered_betas(beta_run1, beta_run2, nan_mask_flat, flat_indices=None):
+    union_nan_mask = np.isnan(beta_run1) | np.isnan(beta_run2)
+    if np.any(union_nan_mask):
+        beta_run1[union_nan_mask] = np.nan
+        beta_run2[union_nan_mask] = np.nan
+    beta_combined = np.concatenate((beta_run1, beta_run2), axis=1)
+    valid_voxel_mask = ~np.all(np.isnan(beta_combined), axis=1)
+    removed_voxels = int(valid_voxel_mask.size - np.count_nonzero(valid_voxel_mask))
+    if removed_voxels > 0:
+        beta_combined = beta_combined[valid_voxel_mask]
+        if flat_indices is not None and nan_mask_flat is not None:
+            nan_mask_flat = np.asarray(nan_mask_flat, dtype=bool)
+            dropped_flat = np.asarray(flat_indices)[~valid_voxel_mask]
+            nan_mask_flat[dropped_flat] = True
+    print(f"Combined filtered beta shape: {beta_combined.shape}", flush=True)
+    print(f"Removed voxels with all-NaN trials: {removed_voxels}", flush=True)
+    return beta_combined, nan_mask_flat
+
 # %% 
 ses = 1
 sub = "04"
-num_trials = 90
+num_trials = 180
 trial_len = 9
 behave_indice = 1 #1/RT
 
@@ -37,48 +103,58 @@ gray_mask_path = f"{base_path}/sub-pd0{sub}_ses-{ses}_T1w_brain_pve_1.nii.gz"
 
 # %%
 anat_img = nib.load(f"{base_path}/sub-pd0{sub}_ses-{ses}_T1w_brain.nii.gz")
-bold_data_run1 = np.load(join(base_path, f'fmri_sub{sub}_ses{ses}_run1.npy'))
-bold_data_run2 = np.load(join(base_path, f'fmri_sub{sub}_ses{ses}_run2.npy'))
-bold_matrix = np.concatenate((bold_data_run1, bold_data_run2), axis=1)
+
 brain_mask = nib.load(brain_mask_path).get_fdata().astype(np.float16)
 csf_mask = nib.load(csf_mask_path).get_fdata().astype(np.float16)
 gray_mask = nib.load(gray_mask_path).get_fdata().astype(np.float16)
+
 glm_dict = np.load(f"{base_path}/TYPED_FITHRF_GLMDENOISE_RR_sub{sub}.npy", allow_pickle=True).item()
 beta_glm = _asarray_filled(glm_dict["betasmd"], dtype=np.float32)
-beta_filtered_run1 = np.load(f"{base_path}/cleaned_beta_volume_sub{sub}_ses{ses}_run1.npy")
-beta_filtered_run2 = np.load(f"{base_path}/cleaned_beta_volume_sub{sub}_ses{ses}_run2.npy")
 
-def combine_filtered_betas(beta_run1, beta_run2):
-    union_nan_mask = np.isnan(beta_run1) | np.isnan(beta_run2)
-    if np.any(union_nan_mask):
-        beta_run1[union_nan_mask] = np.nan
-        beta_run2[union_nan_mask] = np.nan
-    beta_combined = np.concatenate((beta_run1, beta_run2), axis=1)
-    # Remove voxels that have no finite values across all trials after combining.
-    valid_voxel_mask = ~np.all(np.isnan(beta_combined), axis=1)
-    removed_voxels = int(valid_voxel_mask.size - np.count_nonzero(valid_voxel_mask))
-    if removed_voxels > 0:
-        beta_combined = beta_combined[valid_voxel_mask]
-    print(f"Combined filtered beta shape: {beta_combined.shape}")
-    print(f"Removed voxels with all-NaN trials: {removed_voxels}")
-    return beta_combined
-beta_clean = combine_filtered_betas(beta_filtered_run1, beta_filtered_run2)
+nan_mask_flat_run1 = np.load(f"nan_mask_flat_sub{sub}_ses{ses}_run1.npy")
+nan_mask_flat_run2 = np.load(f"nan_mask_flat_sub{sub}_ses{ses}_run2.npy")
 
-# I need to write a function which apply the nan mask of the combined_filtered_betas on the Bold data.
-# The bold is 4-D, so I need to have 3-D mask of betas first
-# After you applied both mask, check if you have equal voxel in the combined bold and beta
-bold_clean = bold_matrix # change it
+beta_volume_filtered_run1 = np.load(f"{base_path}/cleaned_beta_volume_sub{sub}_ses{ses}_run1.npy")
+beta_volume_filtered_run2 = np.load(f"{base_path}/cleaned_beta_volume_sub{sub}_ses{ses}_run2.npy")
+beta_filtered_run1  = np.load(f"beta_volume_filter_sub{sub}_ses{ses}_run1.npy") 
+beta_filtered_run2  = np.load(f"beta_volume_filter_sub{sub}_ses{ses}_run2.npy") 
 
-mask_2d = np.load(f"nan_mask_flat_sub{sub}_ses{ses}_run1.npy")
-print(f"mask_2d: {mask_2d.shape}", flush=True)
-beta_volume_clean_2d  = np.load(f"beta_volume_filter_sub{sub}_ses{ses}_run1.npy.npy") 
-print(f"beta_volume_clean_2d: {beta_volume_clean_2d.shape}", flush=True)
-active_flat_idx = np.load(f"active_flat_indices__sub{sub}_ses{ses}_run1.npy")
-print(f"active_flat_idx: {active_flat_idx.shape}", flush=True)
-clean_active_bold = np.load(f"active_bold_sub{sub}_ses{ses}_run1.npy.npy")
-print(f"clean_active_bold: {clean_active_bold.shape}", flush=True)
-active_coords = np.load(f"active_coords_sub{sub}_ses{ses}_run1.npy")
-print(f"active_coords: {active_coords.shape}", flush=True)
+beta_filtered_run1, beta_filtered_run2, shared_nan_mask_flat, shared_flat_indices = synchronize_beta_voxels(
+    beta_filtered_run1, beta_filtered_run2, nan_mask_flat_run1, nan_mask_flat_run2)
+nan_mask_shape = shared_nan_mask_flat.shape
+nan_mask_flat = shared_nan_mask_flat.ravel()
+print(f"shared_nan_mask_flat: {shared_nan_mask_flat.shape}", flush=True)
+beta_clean, nan_mask_flat = combine_filtered_betas(
+    beta_filtered_run1, beta_filtered_run2, nan_mask_flat, shared_flat_indices)
+shared_nan_mask_flat = nan_mask_flat.reshape(nan_mask_shape)
+
+bold_data_run1 = np.load(join(base_path, f'fmri_sub{sub}_ses{ses}_run1.npy'))
+bold_data_run2 = np.load(join(base_path, f'fmri_sub{sub}_ses{ses}_run2.npy'))
+clean_active_bold_run1 = np.load(f"active_bold_sub{sub}_ses{ses}_run1.npy")
+clean_active_bold_run2 = np.load(f"active_bold_sub{sub}_ses{ses}_run2.npy")
+
+
+# mask_3d = nan_mask_flat.reshape(mask_volume_shape)
+# mask_broadcast = np.broadcast_to(mask_3d[..., None], bold_data_run1.shape)
+# bold_data_run1 = np.asarray(bold_data_run1, dtype=np.float32, order="C")
+# bold_data_run2 = np.asarray(bold_data_run2, dtype=np.float32, order="C")
+# np.copyto(bold_data_run1, np.nan, where=mask_broadcast)
+# np.copyto(bold_data_run2, np.nan, where=mask_broadcast)
+# bold_clean = np.concatenate((bold_data_run1, bold_data_run2), axis=-1)
+# print(f"bold_matrix (masked) shape: {bold_clean.shape}", flush=True)
+
+active_coords_run1 = np.load(f"active_coords_sub{sub}_ses{ses}_run1.npy", allow_pickle=True)
+active_coords_run2 = np.load(f"active_coords_sub{sub}_ses{ses}_run2.npy", allow_pickle=True)
+# Each `active_coords` array is the tuple of (x, y, z) indices saved during preprocessing for the voxels that stayed active after the statistical and Hampel filtering steps.
+
+active_flat_idx, shared_coords, bold_clean = combine_active_run_data(active_coords_run1, active_coords_run2, 
+                                                                               clean_active_bold_run1, clean_active_bold_run2,
+                                                                               bold_data_run1.shape[:3], shared_nan_mask_flat)
+
+active_coords = np.asarray(shared_coords, dtype=object)
+print(f"Combined active_flat_idx: {active_flat_idx.shape}", flush=True)
+print(f"Combined clean_active_bold: {bold_clean.shape}", flush=True)
+print(f"Combined active_coords: {active_coords.shape}", flush=True)
 
 # %%
 behav_data = loadmat(f"{base_path}/PSPD0{sub}_OFF_behav_metrics.mat" if ses == 1 else f"{base_path}/PSPD0{sub}_ON_behav_metrics.mat")
@@ -88,208 +164,212 @@ _, _, num_metrics = behav_block.shape
 behavior_matrix = behav_block.reshape(-1, num_metrics)
 print(f"Behavior matrix shape: {behavior_matrix.shape}")
 # %%
-# def calcu_matrices_func(beta_pca, bold_pca, behave_mat, behave_indice, trial_len=trial_len, num_trials=90):
-#     bold_pca_reshape = bold_pca.reshape(bold_pca.shape[0], num_trials, trial_len)
-#     behavior_selected = behave_mat[:, behave_indice]
+def calcu_matrices_func(beta_pca, bold_pca, behave_mat, behave_indice, trial_len=trial_len, num_trials=180):
+    bold_pca_reshape = bold_pca.reshape(bold_pca.shape[0], num_trials, trial_len)
+    behavior_selected = behave_mat[:, behave_indice]
 
-#     # print("L_task...", flush=True)
-#     counts = np.count_nonzero(np.isfinite(beta_pca), axis=-1)
-#     sums = np.nansum(np.abs(beta_pca), axis=-1, dtype=np.float32)
-#     mean_beta = np.zeros(beta_pca.shape[0], dtype=np.float32)
-#     mask = counts > 0
-#     mean_beta[mask] = (sums[mask] / counts[mask]).astype(np.float32)
+    # print("L_task...", flush=True)
+    counts = np.count_nonzero(np.isfinite(beta_pca), axis=-1)
+    sums = np.nansum(np.abs(beta_pca), axis=-1, dtype=np.float32)
+    mean_beta = np.zeros(beta_pca.shape[0], dtype=np.float32)
+    mask = counts > 0
+    mean_beta[mask] = (sums[mask] / counts[mask]).astype(np.float32)
 
-#     C_task = np.zeros_like(mean_beta, dtype=np.float32)
-#     valid = np.abs(mean_beta) > 0
-#     C_task[valid] = (1.0 / mean_beta[valid]).astype(np.float32)
-#     C_task = np.diag(C_task)
+    C_task = np.zeros_like(mean_beta, dtype=np.float32)
+    valid = np.abs(mean_beta) > 0
+    C_task[valid] = (1.0 / mean_beta[valid]).astype(np.float32)
+    C_task = np.diag(C_task)
 
-#     # print("L_var...", flush=True)
-#     C_bold = np.zeros((bold_pca_reshape.shape[0], bold_pca_reshape.shape[0]), dtype=np.float32)
-#     for i in range(num_trials - 1):
-#         x1 = bold_pca_reshape[:, i, :]
-#         x2 = bold_pca_reshape[:, i + 1, :]
-#         C_bold += (x1 - x2) @ (x1 - x2).T
-#     C_bold /= (num_trials - 1)
+    # print("L_var...", flush=True)
+    C_bold = np.zeros((bold_pca_reshape.shape[0], bold_pca_reshape.shape[0]), dtype=np.float32)
+    for i in range(num_trials - 1):
+        if i== 89:
+            continue
+        x1 = bold_pca_reshape[:, i, :]
+        x2 = bold_pca_reshape[:, i + 1, :]
+        C_bold += (x1 - x2) @ (x1 - x2).T
+    C_bold /= (num_trials - 2) #not considered the transition between runs
 
-#     # print("L_var...", flush=True)
-#     C_beta = np.zeros((beta_pca.shape[0], beta_pca.shape[0]), dtype=np.float32)
-#     for i in range(num_trials - 1):
-#         x1 = beta_pca[:, i]
-#         x2 = beta_pca[:, i + 1]
-#         diff = x1 - x2
-#         C_beta += np.outer(diff, diff)
-#     C_beta /= (num_trials - 1)
+    # print("L_var...", flush=True)
+    C_beta = np.zeros((beta_pca.shape[0], beta_pca.shape[0]), dtype=np.float32)
+    for i in range(num_trials - 1):
+        if i== 89:
+            continue
+        x1 = beta_pca[:, i]
+        x2 = beta_pca[:, i + 1]
+        diff = x1 - x2
+        C_beta += np.outer(diff, diff)
+    C_beta /= (num_trials - 2)
 
-#     return C_task, C_bold, C_beta, behavior_selected
+    return C_task, C_bold, C_beta, behavior_selected
 
-# def standardize_matrix(matrix):
-#     sym_array = 0.5 * (matrix + matrix.T)
-#     trace_value = np.trace(sym_array)
-#     if not np.isfinite(trace_value) or trace_value == 0:
-#         trace_value = 1.0
-#     normalized = sym_array / trace_value * sym_array.shape[0]
-#     # print(f"range after: {np.min(normalized)}, {np.max(normalized)}")
-#     return normalized.astype(matrix.dtype, copy=False)
+def standardize_matrix(matrix):
+    sym_array = 0.5 * (matrix + matrix.T)
+    trace_value = np.trace(sym_array)
+    if not np.isfinite(trace_value) or trace_value == 0:
+        trace_value = 1.0
+    normalized = sym_array / trace_value * sym_array.shape[0]
+    # print(f"range after: {np.min(normalized)}, {np.max(normalized)}")
+    return normalized.astype(matrix.dtype, copy=False)
 
-# def _reshape_trials(bold_matrix, num_trials, trial_length, error_label="BOLD"):
-#     num_voxels, num_timepoints = bold_matrix.shape
-#     bold_by_trial = np.full((num_voxels, num_trials, trial_length), np.nan, dtype=np.float32)
+def _reshape_trials(bold_matrix, num_trials, trial_length, error_label="BOLD"):
+    num_voxels, num_timepoints = bold_matrix.shape
+    bold_by_trial = np.full((num_voxels, num_trials, trial_length), np.nan, dtype=np.float32)
 
-#     start_idx = 0
-#     for trial_idx in range(num_trials):
-#         end_idx = start_idx + trial_length
-#         if end_idx > num_timepoints:
-#             raise ValueError(f"{error_label} data does not contain enough timepoints for all trials.")
-#         bold_by_trial[:, trial_idx, :] = bold_matrix[:, start_idx:end_idx]
-#         start_idx += trial_length
-#         if start_idx in (270, 560):
-#             start_idx += 20
-#     return bold_by_trial
+    start_idx = 0
+    for trial_idx in range(num_trials):
+        end_idx = start_idx + trial_length
+        if end_idx > num_timepoints:
+            raise ValueError(f"{error_label} data does not contain enough timepoints for all trials.")
+        bold_by_trial[:, trial_idx, :] = bold_matrix[:, start_idx:end_idx]
+        start_idx += trial_length
+        if start_idx in (270, 560):
+            start_idx += 20
+    return bold_by_trial
 
 # def _extract_active_bold_trials(bold_timeseries, coords, num_trials, trial_length):
 #     coord_arrays = tuple(np.asarray(axis, dtype=int) for axis in coords)
 #     bold_active = bold_timeseries[coord_arrays[0], coord_arrays[1], coord_arrays[2], :]
 #     return _reshape_trials(bold_active, num_trials, trial_length, error_label="Active BOLD")
 
-# def apply_empca(bold_clean):
-#     print("PCA...", flush=True)
-#     def prepare_for_empca(data):
-#         W = np.isfinite(data).astype(float)
-#         Y = np.where(np.isfinite(data), data, 0.0)
+def apply_empca(bold_clean):
+    print("PCA...", flush=True)
+    def prepare_for_empca(data):
+        W = np.isfinite(data).astype(float)
+        Y = np.where(np.isfinite(data), data, 0.0)
 
-#         row_weight = W.sum(axis=0, keepdims=True)
-#         print(row_weight.shape)
-#         mean = np.divide((Y * W).sum(axis=0, keepdims=True), row_weight, out=np.zeros_like(row_weight), where=row_weight > 0)
-#         centered = Y - mean
+        row_weight = W.sum(axis=0, keepdims=True)
+        print(row_weight.shape)
+        mean = np.divide((Y * W).sum(axis=0, keepdims=True), row_weight, out=np.zeros_like(row_weight), where=row_weight > 0)
+        centered = Y - mean
 
-#         var = np.divide((W * centered**2).sum(axis=0, keepdims=True), row_weight, out=np.zeros_like(row_weight), where=row_weight > 0)
-#         scale = np.sqrt(var)
-#         print(mean.shape, scale.shape)
+        var = np.divide((W * centered**2).sum(axis=0, keepdims=True), row_weight, out=np.zeros_like(row_weight), where=row_weight > 0)
+        scale = np.sqrt(var)
+        print(mean.shape, scale.shape)
 
-#         z = np.divide(centered, np.maximum(scale, 1e-6), out=np.zeros_like(centered), where=row_weight > 0)
-#         return z, W
-#     X_reshap = bold_clean.reshape(bold_clean.shape[0], -1)
-#     print(f"epca func, X_reshap: {X_reshap.shape}")
-#     Yc, W = prepare_for_empca(X_reshap.T)
-#     Yc = Yc.T
-#     W = W.T
-#     print(Yc.shape, W.shape)
+        z = np.divide(centered, np.maximum(scale, 1e-6), out=np.zeros_like(centered), where=row_weight > 0)
+        return z, W
+    X_reshap = bold_clean.reshape(bold_clean.shape[0], -1)
+    print(f"bold_by_trial: {X_reshap.shape}")
+    print(f"epca func, X_reshap: {X_reshap.shape}")
+    Yc, W = prepare_for_empca(X_reshap.T)
+    Yc = Yc.T
+    W = W.T
+    print(Yc.shape, W.shape)
 
-#     print("begin empca...", flush=True)
-#     m = empca(Yc.astype(np.float32, copy=False), W.astype(np.float32, copy=False), nvec=700, niter=15)
-#     np.save(f'empca_model_sub{sub}_ses{ses}.npy', m)
-#     return m
+    print("begin empca...", flush=True)
+    m = empca(Yc.astype(np.float32, copy=False), W.astype(np.float32, copy=False), nvec=700, niter=15)
+    np.save(f'empca_model_sub{sub}_ses{ses}.npy', m)
+    return m
 
-# def prepare_data_func(bold_clean, beta_clean, behavioral_matrix, nan_mask, trial_length, num_trials):
-#     # load the rsults
-#     # nan_mask_flat, active_coords, active_beta
-#     # does "compute_component_active_beta_correlation" really need active_beta? or you can have a generall mask?
-#     pca_model = apply_empca(bold_clean)
-#     bold_pca_components = pca_model.eigvec
-#     coeff_pinv = np.linalg.pinv(pca_model.coeff)
-#     beta_pca = coeff_pinv @ np.nan_to_num(beta_clean)
+def prepare_data_func(bold_clean, beta_clean, behavioral_matrix, nan_mask_flat, active_coords, trial_length, num_trials):
+    pca_model = apply_empca(bold_clean)
+    bold_pca_components = pca_model.eigvec
+    print(f"bold_pca_components: {bold_pca_components.shape}")
+    coeff_pinv = np.linalg.pinv(pca_model.coeff)
+    beta_pca = coeff_pinv @ np.nan_to_num(beta_clean)
+    print(f"beta_pca: {beta_pca.shape}")
 
-#     (C_task, C_bold, C_beta, behavior_vector) = calcu_matrices_func(beta_pca, bold_pca_components, behavioral_matrix, 
-#                                                                     behave_indice, trial_len=trial_length, num_trials=num_trials)
-#     C_task = standardize_matrix(C_task)
-#     C_bold = standardize_matrix(C_bold)
-#     C_beta = standardize_matrix(C_beta)
+    (C_task, C_bold, C_beta, behavior_vector) = calcu_matrices_func(beta_pca, bold_pca_components, behavioral_matrix, 
+                                                                    behave_indice, trial_len=trial_length, num_trials=num_trials)
+    C_task = standardize_matrix(C_task)
+    C_bold = standardize_matrix(C_bold)
+    C_beta = standardize_matrix(C_beta)
+    print(f"shape: {C_task.shape}, {C_bold.shape}, {C_beta.shape}", flush=True)
+    print(f"Range: [{np.min(C_task)}, {np.max(C_task)}], [{np.min(C_bold)}, {np.max(C_bold)}],[{np.min(C_beta)}, {np.max(C_beta)}]", flush=True)
     
-#     trial_mask = np.isfinite(behavior_vector)
-#     behavior_observed = behavior_vector[trial_mask]
-#     behavior_mean = np.mean(behavior_observed)
-#     behavior_centered = behavior_observed - behavior_mean
-#     behavior_norm = np.linalg.norm(behavior_centered)
-#     normalized_behaviors = behavior_centered / behavior_norm
+    trial_mask = np.isfinite(behavior_vector)
+    behavior_observed = behavior_vector[trial_mask]
+    behavior_mean = np.mean(behavior_observed)
+    behavior_centered = behavior_observed - behavior_mean
+    behavior_norm = np.linalg.norm(behavior_centered)
+    print(f"behavior_norm: {behavior_norm}")
+    normalized_behaviors = behavior_centered / behavior_norm
 
-#     beta_observed = beta_pca[:, trial_mask]
-#     beta_centered = beta_observed - np.mean(beta_observed, axis=1, keepdims=True)
+    beta_observed = beta_pca[:, trial_mask]
+    beta_centered = beta_observed - np.mean(beta_observed, axis=1, keepdims=True)
 
-#     return {"nan_mask_flat": nan_mask_flat, "active_coords": tuple(np.array(coord) for coord in active_coords),
-#         "coeff_pinv": coeff_pinv, "beta_centered": beta_centered, "behavior_centered": behavior_centered, 
-#         "normalized_behaviors": normalized_behaviors, "behavior_observed": behavior_observed, "beta_observed": beta_observed,
-#         "beta_volume_clean": beta_clean, "C_task": C_task, "C_bold": C_bold, "C_beta": C_beta,
-#         "active_bold": bold_clean, "active_beta": active_beta, "active_flat_indices": active_flat_indices}, pca_model
+    return {"nan_mask_flat": nan_mask_flat, "active_coords": tuple(np.array(coord) for coord in active_coords),
+        "coeff_pinv": coeff_pinv, "beta_centered": beta_centered, "behavior_centered": behavior_centered, 
+        "normalized_behaviors": normalized_behaviors, "behavior_observed": behavior_observed, "beta_observed": beta_observed,
+        "beta_clean": beta_clean, "C_task": C_task, "C_bold": C_bold, "C_beta": C_beta, "active_bold": bold_clean,}, pca_model
 
-# def calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta):
-#     beta_centered = run_data["beta_centered"]
-#     n_components = beta_centered.shape[0]
+def calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta):
+    beta_centered = run_data["beta_centered"]
+    n_components = beta_centered.shape[0]
 
-#     task_penalty = alpha_task * run_data["C_task"]
-#     bold_penalty = alpha_bold * run_data["C_bold"]
-#     beta_penalty = alpha_beta * run_data["C_beta"]
-#     total_penalty = task_penalty + bold_penalty + beta_penalty
-#     total_penalty = 0.5 * (total_penalty + total_penalty.T)
-#     total_penalty = total_penalty + 1e-6 * np.eye(n_components)
+    task_penalty = alpha_task * run_data["C_task"]
+    bold_penalty = alpha_bold * run_data["C_bold"]
+    beta_penalty = alpha_beta * run_data["C_beta"]
+    total_penalty = task_penalty + bold_penalty + beta_penalty
+    total_penalty = 0.5 * (total_penalty + total_penalty.T)
+    total_penalty = total_penalty + 1e-6 * np.eye(n_components)
 
-#     return {"task": task_penalty, "bold": bold_penalty, "beta": beta_penalty}, total_penalty
+    return {"task": task_penalty, "bold": bold_penalty, "beta": beta_penalty}, total_penalty
 
-# def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, solver_name, phro): # I should change this function
-#     beta_centered = run_data["beta_centered"]
-#     normalized_behaviors = run_data["normalized_behaviors"]
-#     n_components = beta_centered.shape[0]
+def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, solver_name, phro): # I should change this function
+    beta_centered = run_data["beta_centered"]
+    normalized_behaviors = run_data["normalized_behaviors"]
+    n_components = beta_centered.shape[0]
 
-#     penalty_matrices, total_penalty = calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta)
+    penalty_matrices, total_penalty = calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta)
 
-#     weights_positive = cp.Variable(n_components)
-#     weights_negative = cp.Variable(n_components)
-#     projections_positive = beta_centered.T @ weights_positive
-#     projections_negative = beta_centered.T @ weights_negative
+    weights_positive = cp.Variable(n_components)
+    weights_negative = cp.Variable(n_components)
+    projections_positive = beta_centered.T @ weights_positive
+    projections_negative = beta_centered.T @ weights_negative
 
-#     constraints_positive = [weights_positive >= 0, cp.sum(weights_positive) == 1,
-#         cp.SOC((1.0 / phro) * (normalized_behaviors @ projections_positive), projections_positive)]
-#     problem_positive = cp.Problem(cp.Minimize(cp.quad_form(weights_positive, cp.psd_wrap(total_penalty))), constraints_positive)
+    constraints_positive = [weights_positive >= 0, cp.sum(weights_positive) == 1,
+        cp.SOC((1.0 / phro) * (normalized_behaviors @ projections_positive), projections_positive)]
+    problem_positive = cp.Problem(cp.Minimize(cp.quad_form(weights_positive, cp.psd_wrap(total_penalty))), constraints_positive)
 
 
-#     constraints_negative = [weights_negative >= 0, cp.sum(weights_negative) == 1,
-#         cp.SOC((1.0 / phro) * (-normalized_behaviors @ projections_negative), projections_negative)]
-#     problem_negative = cp.Problem(cp.Minimize(cp.quad_form(weights_negative, cp.psd_wrap(total_penalty))), constraints_negative)
+    constraints_negative = [weights_negative >= 0, cp.sum(weights_negative) == 1,
+        cp.SOC((1.0 / phro) * (-normalized_behaviors @ projections_negative), projections_negative)]
+    problem_negative = cp.Problem(cp.Minimize(cp.quad_form(weights_negative, cp.psd_wrap(total_penalty))), constraints_negative)
 
-#     objective_positive = np.inf
-#     objective_negative = np.inf
-#     problem_positive.solve(solver=solver_name, warm_start=True)
-#     problem_negative.solve(solver=solver_name, warm_start=True)
+    objective_positive = np.inf
+    objective_negative = np.inf
+    problem_positive.solve(solver=solver_name, warm_start=True)
+    problem_negative.solve(solver=solver_name, warm_start=True)
 
-#     lam_nonneg   = constraints_positive[0].dual_value   # vector (same size as w) for w >= 0
-#     lam_sum1     = constraints_positive[1].dual_value   # scalar for sum(w) == 1
-#     lam_soc_tau, lam_soc_vec = constraints_positive[2].dual_value
-#     # print(f"lambda Positive: {np.sum(lam_nonneg)}, {lam_sum1}, {lam_soc_tau}, {np.sum(lam_soc_vec)}")
+    lam_nonneg   = constraints_positive[0].dual_value   # vector (same size as w) for w >= 0
+    lam_sum1     = constraints_positive[1].dual_value   # scalar for sum(w) == 1
+    lam_soc_tau, lam_soc_vec = constraints_positive[2].dual_value
+    # print(f"lambda Positive: {np.sum(lam_nonneg)}, {lam_sum1}, {lam_soc_tau}, {np.sum(lam_soc_vec)}")
 
-#     lam_nonneg   = constraints_negative[0].dual_value   # vector (same size as w) for w >= 0
-#     lam_sum1     = constraints_negative[1].dual_value   # scalar for sum(w) == 1
-#     lam_soc_tau, lam_soc_vec = constraints_negative[2].dual_value
-#     # print(f"lambda Negative: {np.sum(lam_nonneg)}, {lam_sum1}, {lam_soc_tau}, {np.sum(lam_soc_vec)}")
+    lam_nonneg   = constraints_negative[0].dual_value   # vector (same size as w) for w >= 0
+    lam_sum1     = constraints_negative[1].dual_value   # scalar for sum(w) == 1
+    lam_soc_tau, lam_soc_vec = constraints_negative[2].dual_value
+    # print(f"lambda Negative: {np.sum(lam_nonneg)}, {lam_sum1}, {lam_soc_tau}, {np.sum(lam_soc_vec)}")
 
-#     positive_valid = weights_positive.value is not None and problem_positive.status in ("optimal", "optimal_inaccurate")
-#     negative_valid = weights_negative.value is not None and problem_negative.status in ("optimal", "optimal_inaccurate")
+    positive_valid = weights_positive.value is not None and problem_positive.status in ("optimal", "optimal_inaccurate")
+    negative_valid = weights_negative.value is not None and problem_negative.status in ("optimal", "optimal_inaccurate")
 
-#     if positive_valid: objective_positive = problem_positive.value
-#     if negative_valid:objective_negative = problem_negative.value
+    if positive_valid: objective_positive = problem_positive.value
+    if negative_valid:objective_negative = problem_negative.value
 
-#     solution_branch = None
-#     solution_weights = None
+    solution_branch = None
+    solution_weights = None
 
-#     if positive_valid and (not negative_valid or objective_positive <= objective_negative):
-#         solution_branch = "positive"
-#         solution_weights = np.array(weights_positive.value, dtype=np.float64).ravel()
-#     elif negative_valid:
-#         solution_branch = "negative"
-#         solution_weights = np.array(weights_negative.value, dtype=np.float64).ravel()
+    if positive_valid and (not negative_valid or objective_positive <= objective_negative):
+        solution_branch = "positive"
+        solution_weights = np.array(weights_positive.value, dtype=np.float64).ravel()
+    elif negative_valid:
+        solution_branch = "negative"
+        solution_weights = np.array(weights_negative.value, dtype=np.float64).ravel()
 
-#     if solution_weights is None or solution_weights.size != n_components:
-#         raise RuntimeError(
-#             f"SOC solver failed to find a feasible solution "
-#             f"(positive status={problem_positive.status}, negative status={problem_negative.status})."
-#         )
+    if solution_weights is None or solution_weights.size != n_components:
+        raise RuntimeError(f"SOC solver failed to find a feasible solution "
+                           f"(positive status={problem_positive.status}, negative status={problem_negative.status}).")
 
-#     contributions = {label: float(solution_weights.T @ matrix @ solution_weights) for label, matrix in penalty_matrices.items()}
+    contributions = {label: float(solution_weights.T @ matrix @ solution_weights) for label, matrix in penalty_matrices.items()}
 
-#     y = beta_centered.T @ solution_weights
-#     total_loss = float(solution_weights.T @ total_penalty @ solution_weights)
+    y = beta_centered.T @ solution_weights
+    total_loss = float(solution_weights.T @ total_penalty @ solution_weights)
 
-#     return {"weights": solution_weights, "branch": solution_branch, "total_loss": total_loss, "Y": y,
-#             "objective_positive": objective_positive, "objective_negative": objective_negative, "penalty_contributions": contributions}
+    return {"weights": solution_weights, "branch": solution_branch, "total_loss": total_loss, "Y": y,
+            "objective_positive": objective_positive, "objective_negative": objective_negative, "penalty_contributions": contributions}
 
 # def evaluate_projection(run_data, weights):
 #     beta_centered = run_data["beta_centered"]
@@ -433,31 +513,32 @@ print(f"Behavior matrix shape: {behavior_matrix.shape}")
 #     num_trials = y_values.size // trial_length
 #     return y_values, y_values.reshape(num_trials, trial_length)
 
-# def _compute_weighted_active_bold_projection(voxel_weights, run_data):
-#     active_bold = run_data.get("active_bold")
-#     active_flat_indices = run_data.get("active_flat_indices")
-#     nan_mask_flat = run_data.get("nan_mask_flat")
-#     voxel_weights = voxel_weights.ravel()
-#     valid_flat_indices = np.flatnonzero(~np.asarray(nan_mask_flat, dtype=bool).ravel())
-#     positions = np.searchsorted(valid_flat_indices, np.asarray(active_flat_indices).ravel())
+def _compute_weighted_active_bold_projection(voxel_weights, data):
+    active_bold = data.get("active_bold")
+    # active_flat_indices = data.get("active_flat_indices")
+    nan_mask_flat = data.get("nan_mask_flat")
+    voxel_weights = voxel_weights.ravel()
+    positions = nan_mask_flat     # I am not sure this part is correct.
+    # valid_flat_indices = np.flatnonzero(~np.asarray(nan_mask_flat, dtype=bool).ravel())
+    # positions = np.searchsorted(valid_flat_indices, np.asarray(active_flat_indices).ravel())
 
-#     active_voxel_weights = voxel_weights[positions]
-#     active_bold = _asarray_filled(active_bold, dtype=np.float64)
-#     bold_matrix = active_bold.reshape(active_bold.shape[0], -1).copy()
-#     with np.errstate(invalid="ignore"):
-#         voxel_means = np.nanmean(bold_matrix, axis=1, keepdims=True)
-#     voxel_means = np.where(np.isfinite(voxel_means), voxel_means, 0.0)
-#     bold_matrix -= voxel_means
-#     timepoints = bold_matrix.shape[1]
-#     projection = np.full(timepoints, np.nan, dtype=np.float64)
+    active_voxel_weights = voxel_weights[positions]
+    active_bold = _asarray_filled(active_bold, dtype=np.float64)
+    bold_matrix = active_bold.reshape(active_bold.shape[0], -1).copy()
+    with np.errstate(invalid="ignore"):
+        voxel_means = np.nanmean(bold_matrix, axis=1, keepdims=True)
+    voxel_means = np.where(np.isfinite(voxel_means), voxel_means, 0.0)
+    bold_matrix -= voxel_means
+    timepoints = bold_matrix.shape[1]
+    projection = np.full(timepoints, np.nan, dtype=np.float64)
 
-#     finite_mask = np.isfinite(bold_matrix)
-#     for t_idx in range(timepoints):
-#         voxel_mask = finite_mask[:, t_idx]
-#         if not np.any(voxel_mask):
-#             continue
-#         projection[t_idx] = np.dot(active_voxel_weights[voxel_mask], bold_matrix[voxel_mask, t_idx])
-#     return projection, bold_matrix
+    finite_mask = np.isfinite(bold_matrix)
+    for t_idx in range(timepoints):
+        voxel_mask = finite_mask[:, t_idx]
+        if not np.any(voxel_mask):
+            continue
+        projection[t_idx] = np.dot(active_voxel_weights[voxel_mask], bold_matrix[voxel_mask, t_idx])
+    return projection, bold_matrix
 
 # def _resolve_trial_metric(metric):
 #     if metric is None:
@@ -470,30 +551,30 @@ print(f"Behavior matrix shape: {behavior_matrix.shape}")
 #     if metric_key in ("median", "nanmedian"):
 #         return np.nanmedian
 
-# def _describe_trial_metric(metric):
-#     if metric is None:
-#         return "mean"
-#     if isinstance(metric, str):
-#         metric_key = metric.strip().lower()
-#         return metric_key or "mean"
-#     return getattr(metric, "__name__", "custom_metric")
+def _describe_trial_metric(metric):
+    if metric is None:
+        return "mean"
+    if isinstance(metric, str):
+        metric_key = metric.strip().lower()
+        return metric_key or "mean"
+    return getattr(metric, "__name__", "custom_metric")
 
-# def _safe_pearsonr(x, y):
-#     x = _asarray_filled(x, dtype=np.float64).ravel()
-#     y = _asarray_filled(y, dtype=np.float64).ravel()
-#     if x.size != y.size or x.size < 2:
-#         return np.nan
-#     finite_mask = np.isfinite(x) & np.isfinite(y)
-#     if np.count_nonzero(finite_mask) < 2:
-#         return np.nan
-#     x = x[finite_mask]
-#     y = y[finite_mask]
-#     x -= x.mean()
-#     y -= y.mean()
-#     denom = np.sqrt(np.dot(x, x) * np.dot(y, y))
-#     if not np.isfinite(denom) or denom <= 0:
-#         return np.nan
-#     return float(np.dot(x, y) / denom)
+def _safe_pearsonr(x, y):
+    x = _asarray_filled(x, dtype=np.float64).ravel()
+    y = _asarray_filled(y, dtype=np.float64).ravel()
+    if x.size != y.size or x.size < 2:
+        return np.nan
+    finite_mask = np.isfinite(x) & np.isfinite(y)
+    if np.count_nonzero(finite_mask) < 2:
+        return np.nan
+    x = x[finite_mask]
+    y = y[finite_mask]
+    x -= x.mean()
+    y -= y.mean()
+    denom = np.sqrt(np.dot(x, x) * np.dot(y, y))
+    if not np.isfinite(denom) or denom <= 0:
+        return np.nan
+    return float(np.dot(x, y) / denom)
 
 # def _aggregate_trials(active_bold, reducer):
 #     # downsample bold data by reducer metrice
@@ -548,45 +629,44 @@ print(f"Behavior matrix shape: {behavior_matrix.shape}")
 #         correlations[voxel_idx] = _safe_pearsonr(projection[joint_mask], voxel_series[joint_mask])
 #     return projection, correlations
 
-# def compute_component_active_bold_correlation(voxel_weights, run_data):
-#     # corr(weight * bold, bold)
-#     projection, bold_matrix = _compute_weighted_active_bold_projection(voxel_weights, run_data)
-#     correlations = np.full(bold_matrix.shape[0], np.nan, dtype=np.float32)
-#     projection_finite = np.isfinite(projection)
-#     for voxel_idx, voxel_series in enumerate(bold_matrix):
-#         voxel_finite = np.isfinite(voxel_series)
-#         joint_mask = projection_finite & voxel_finite
-#         if np.count_nonzero(joint_mask) < 2:
-#             continue
-#         correlations[voxel_idx] = _safe_pearsonr(projection[joint_mask], voxel_series[joint_mask])
-#     return projection, correlations
+def compute_component_active_bold_correlation(voxel_weights, data):
+    # corr(weight * bold, bold)
+    projection, bold_matrix = _compute_weighted_active_bold_projection(voxel_weights, data)
+    correlations = np.full(bold_matrix.shape[0], np.nan, dtype=np.float32)
+    projection_finite = np.isfinite(projection)
+    for voxel_idx, voxel_series in enumerate(bold_matrix):
+        voxel_finite = np.isfinite(voxel_series)
+        joint_mask = projection_finite & voxel_finite
+        if np.count_nonzero(joint_mask) < 2:
+            continue
+        correlations[voxel_idx] = _safe_pearsonr(projection[joint_mask], voxel_series[joint_mask])
+    return projection, correlations
 
-# def save_active_bold_correlation_map(correlations, active_coords, volume_shape, anat_img, file_prefix, result_prefix="active_bold_corr"):
-#     coord_arrays = tuple(np.asarray(axis, dtype=int) for axis in active_coords)
-#     values = np.asarray(correlations, dtype=np.float64).ravel()
-#     display_values = np.abs(values)
-#     corr_path = f"{result_prefix}_{file_prefix}.npy"
-#     # np.save(corr_path, correlations.astype(np.float32))
+def save_active_bold_correlation_map(correlations, active_coords, volume_shape, anat_img, file_prefix, 
+                                     result_prefix="active_bold_corr"):
+    coord_arrays = tuple(np.asarray(axis, dtype=int) for axis in active_coords)
+    display_values = np.abs(correlations.ravel())
+    # corr_path = f"{result_prefix}_{file_prefix}.npy"
+    # np.save(corr_path, correlations.astype(np.float32))
 
-#     volume = np.full(volume_shape, np.nan, dtype=np.float32)
-#     colorbar_max = None
-#     if coord_arrays and coord_arrays[0].size:
-#         volume[coord_arrays] = display_values
-#         finite_values = display_values[np.isfinite(display_values)]
-#         colorbar_max = float(np.percentile(finite_values, 95))
+    volume = np.full(volume_shape, np.nan, dtype=np.float32)
+    colorbar_max = None
+    if coord_arrays and coord_arrays[0].size:
+        volume[coord_arrays] = display_values
+        finite_values = display_values[np.isfinite(display_values)]
+        colorbar_max = float(np.percentile(finite_values, 95))
 
-#     corr_img = nib.Nifti1Image(volume, anat_img.affine, anat_img.header)
-#     volume_path = f"{result_prefix}_{file_prefix}.nii.gz"
-#     nib.save(corr_img, volume_path)
+    corr_img = nib.Nifti1Image(volume, anat_img.affine, anat_img.header)
+    volume_path = f"{result_prefix}_{file_prefix}.nii.gz"
+    nib.save(corr_img, volume_path)
 
-#     if np.any(np.isfinite(display_values)):
-#         display_volume = np.nan_to_num(volume, nan=0.0, posinf=0.0, neginf=0.0)
-#         display_volume = np.clip(display_volume, 0.0, colorbar_max)
-#         display_img = nib.Nifti1Image(display_volume, anat_img.affine, anat_img.header)
-#         display = plotting.view_img(display_img, bg_img=anat_img, colorbar=True, symmetric_cmap= False, cmap='jet')
-#         display.save_as_html(f"{result_prefix}_{file_prefix}.html")
-
-#     return
+    if np.any(np.isfinite(display_values)):
+        display_volume = np.nan_to_num(volume, nan=0.0, posinf=0.0, neginf=0.0)
+        display_volume = np.clip(display_volume, 0.0, colorbar_max)
+        display_img = nib.Nifti1Image(display_volume, anat_img.affine, anat_img.header)
+        display = plotting.view_img(display_img, bg_img=anat_img, colorbar=True, symmetric_cmap= False, cmap='jet')
+        display.save_as_html(f"{result_prefix}_{file_prefix}.html")
+    return
 
 # def plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, output_path, max_trials=10, series_label=None):
 #     num_trials_total, trial_length = y_trials.shape
@@ -695,60 +775,57 @@ print(f"Behavior matrix shape: {behavior_matrix.shape}")
 #     # np.save(f"y_projection_voxel_{file_prefix}.npy", y_projection_voxel)
 #     return y_projection_voxel
 # # %%
-# ridge_penalty = 1e-6
-# solver_name = "MOSEK"
-# soc_ratio = 0.95
+ridge_penalty = 1e-6
+solver_name = "MOSEK"
+soc_ratio = 0.95
 
-# # task_penalty_sweep = [0.0, 0.5, 100.0]
-# # bold_penalty_sweep = [0.0, 0.25, 100.0]
-# # beta_penalty_sweep = [0, 50.0, 500.0]
-# task_penalty_sweep = [0.5]
-# bold_penalty_sweep = [0.25]
-# beta_penalty_sweep = [50]
-# alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha}
-#     for task_alpha, bold_alpha, beta_alpha in product(task_penalty_sweep, bold_penalty_sweep, beta_penalty_sweep)]
-# # rho_sweep = [0.2, 0.6, 0.8]
-# rho_sweep = [0.6]
-# bootstrap_iterations = 1000
-# trial_downsample_metric = "median"
-# metric_label = _describe_trial_metric(trial_downsample_metric).replace(" ", "_")
+# task_penalty_sweep = [0.0, 0.5, 100.0]
+# bold_penalty_sweep = [0.0, 0.25, 100.0]
+# beta_penalty_sweep = [0, 50.0, 500.0]
+task_penalty_sweep = [0.5]
+bold_penalty_sweep = [0.25]
+beta_penalty_sweep = [50]
+alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha}
+    for task_alpha, bold_alpha, beta_alpha in product(task_penalty_sweep, bold_penalty_sweep, beta_penalty_sweep)]
+# rho_sweep = [0.2, 0.6, 0.8]
+rho_sweep = [0.6]
+bootstrap_iterations = 1000
+trial_downsample_metric = "median"
+metric_label = _describe_trial_metric(trial_downsample_metric).replace(" ", "_")
 
 
-# def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
-#     data, pca_model = prepare_data_func(bold_clean, beta_clean, behavior_matrix, nan_mask, trial_len, num_trials) # Not sue nan_mask is needed.
-#     bold_pca_components = np.asarray(pca_model.eigvec, dtype=np.float64)
+def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
+    data, pca_model = prepare_data_func(bold_clean, beta_clean, behavior_matrix, nan_mask_flat, active_coords, trial_len, num_trials)
+    bold_pca_components = pca_model.eigvec
 
-#     for alpha_setting in alpha_settings:
-#         task_alpha = alpha_setting["task_penalty"]
-#         bold_alpha = alpha_setting["bold_penalty"]
-#         beta_alpha = alpha_setting["beta_penalty"]
-#         rho_projection_series = []
-#         alpha_prefix = f"sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}"
+    for alpha_setting in alpha_settings:
+        task_alpha = alpha_setting["task_penalty"]
+        bold_alpha = alpha_setting["bold_penalty"]
+        beta_alpha = alpha_setting["beta_penalty"]
+        rho_projection_series = []
+        alpha_prefix = f"sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}"
 
-#         for rho_value in rho_values:
-#             sweep_suffix = f"task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_rho{rho_value:g}"
-#             print(f"optimization with task={task_alpha}, bold={bold_alpha}, beta={beta_alpha}, rho={rho_value}", flush=True)
-#             solution = solve_soc_problem(data, task_alpha, bold_alpha, beta_alpha, solver_name, rho_value)
+        for rho_value in rho_values:
+            sweep_suffix = f"task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_rho{rho_value:g}"
+            print(f"optimization with task={task_alpha}, bold={bold_alpha}, beta={beta_alpha}, rho={rho_value}", flush=True)
+            solution = solve_soc_problem(data, task_alpha, bold_alpha, beta_alpha, solver_name, rho_value)
 
-#             component_weights = np.abs(solution["weights"])
-#             coeff_pinv = np.asarray(train_data["coeff_pinv"])
-#             voxel_weights = coeff_pinv.T @ component_weights
-#             # print(f"voxel_weights shape: {voxel_weights.shape}, component_weights shape: {component_weights.shape}")
-#             file_prefix = f"sub{sub}_ses{ses}_{sweep_suffix}"
-#             save_active_bold_correlation_map(voxel_weights, train_data.get("active_coords"), beta_volume_filter_train.shape[:3], anat_img,
-#                                              file_prefix, result_prefix="voxel_weights")
+            component_weights = np.abs(solution["weights"])
+            coeff_pinv = np.asarray(data["coeff_pinv"])
+            voxel_weights = coeff_pinv.T @ component_weights
+            # print(f"voxel_weights shape: {voxel_weights.shape}, component_weights shape: {component_weights.shape}")
+            file_prefix = f"sub{sub}_ses{ses}_{sweep_suffix}"
+            save_active_bold_correlation_map(voxel_weights, data.get("active_coords"), anat_img.shape[:3], anat_img, file_prefix, result_prefix="voxel_weights")
 
-#             # np.save(f"behavior_weights_{file_prefix}.npy", pca_weights)
-#             # np.save(f"behavior_weights_pca_{file_prefix}.npy", weights)
-#             # view_path = save_weight_outputs(anat_img, train_data["active_coords"], pca_weights, file_prefix)
+            # np.save(f"behavior_weights_{file_prefix}.npy", pca_weights)
+            # np.save(f"behavior_weights_pca_{file_prefix}.npy", weights)
 
-#             beta_volume_clean = np.asarray(train_data["beta_volume_clean"], dtype=np.float64)
-#             beta_volume_clean_finite = np.nan_to_num(beta_volume_clean, nan=0.0, posinf=0.0, neginf=0.0)
-#             weighted_voxel_activity = voxel_weights[:, None] * beta_volume_clean_finite
+            # beta_volume_clean_finite = np.nan_to_num(data["beta_clean"], nan=0.0, posinf=0.0, neginf=0.0)
+            # weighted_voxel_activity = voxel_weights[:, None] * beta_volume_clean_finite
 #             weighted_beta_path = f"beta_weighted_activity_{file_prefix}.npy"
 #             # np.save(weighted_beta_path, weighted_voxel_activity.astype(np.float32))
 
-#             projection_signal, voxel_correlations = compute_component_active_bold_correlation(voxel_weights, train_data) 
+            projection_signal, voxel_correlations = compute_component_active_bold_correlation(voxel_weights, data) 
 #             # np.save(f"component_active_bold_projection_{file_prefix}.npy", projection_signal)
 
 #             save_active_bold_correlation_map(voxel_correlations, train_data.get("active_coords"), beta_volume_filter_train.shape[:3], anat_img, file_prefix)
@@ -850,7 +927,7 @@ print(f"Behavior matrix shape: {behavior_matrix.shape}")
 #             plot_projection_beta_sweep(rho_projection_series, task_alpha, bold_alpha, beta_alpha, aggregate_plot_path, series_label="Voxel space")
 
 
-# if __name__ == "__main__":
+if __name__ == "__main__":
 #     parser = argparse.ArgumentParser(description="Run a subset of alpha/rho sweeps.")
 #     parser.add_argument("--alpha-idx", type=int, default=None,
 #                         help="0-based index into alpha_sweep; omit to iterate over all alphas.")
@@ -869,8 +946,8 @@ print(f"Behavior matrix shape: {behavior_matrix.shape}")
 #             except ValueError as exc:
 #                 raise ValueError("SLURM_ARRAY_TASK_ID must be an integer when provided.") from exc
 
-#     selected_alphas = alpha_sweep
-#     selected_rhos = rho_sweep
+    selected_alphas = alpha_sweep
+    selected_rhos = rho_sweep
 
 #     if combo_idx is not None:
 #         total = len(alpha_sweep) * len(rho_sweep)
@@ -892,6 +969,6 @@ print(f"Behavior matrix shape: {behavior_matrix.shape}")
 #             selected_rhos = [rho_sweep[args.rho_idx]]
 #             print(f"Running rho_idx={args.rho_idx}", flush=True)
 
-#     run_cross_run_experiment(selected_alphas, selected_rhos, bootstrap_samples=bootstrap_iterations)
+    run_cross_run_experiment(selected_alphas, selected_rhos, bootstrap_samples=bootstrap_iterations)
 
 # # %%
