@@ -710,25 +710,25 @@ def plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value
     plt.close(fig)
     return output_path
 
-def plot_projection_beta(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, output_path, series_label=None):
-    # y = w*beta
-    y_trials = np.asarray(y_trials, dtype=np.float64).ravel()
-    num_trials = y_trials.size
-    time_axis = np.arange(num_trials)
-    fig_height = 5.0 if num_trials <= 120 else 6.5
+# def plot_projection_beta(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, output_path, series_label=None):
+#     # y = w*beta
+#     y_trials = np.asarray(y_trials, dtype=np.float64).ravel()
+#     num_trials = y_trials.size
+#     time_axis = np.arange(num_trials)
+#     fig_height = 5.0 if num_trials <= 120 else 6.5
 
-    fig, ax = plt.subplots(figsize=(10, fig_height))
-    ax.plot(time_axis, y_trials, linewidth=1.4, alpha=0.95, color="#1f77b4", marker="o", markersize=3)
+#     fig, ax = plt.subplots(figsize=(10, fig_height))
+#     ax.plot(time_axis, y_trials, linewidth=1.4, alpha=0.95, color="#1f77b4", marker="o", markersize=3)
 
-    ax.set_xlabel("Trial index")
-    ax.set_ylabel("Voxel-space projection")
-    label_suffix = f" [{series_label}]" if series_label else ""
-    ax.set_title(f"y_beta | alpha_task={task_alpha:g}, alpha_bold={bold_alpha:g}, alpha_beta={beta_alpha:g}, rho={rho_value:g}{label_suffix}")
-    ax.grid(True, linestyle="--", alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=300)
-    plt.close(fig)
-    return output_path
+#     ax.set_xlabel("Trial index")
+#     ax.set_ylabel("Voxel-space projection")
+#     label_suffix = f" [{series_label}]" if series_label else ""
+#     ax.set_title(f"y_beta | alpha_task={task_alpha:g}, alpha_bold={bold_alpha:g}, alpha_beta={beta_alpha:g}, rho={rho_value:g}{label_suffix}")
+#     ax.grid(True, linestyle="--", alpha=0.3)
+#     fig.tight_layout()
+#     fig.savefig(output_path, dpi=300)
+#     plt.close(fig)
+#     return output_path
 
 def plot_projection_beta_sweep(rho_projection_series, task_alpha, bold_alpha, beta_alpha, output_path, series_label=None):
     if not rho_projection_series:

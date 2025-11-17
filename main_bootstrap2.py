@@ -15,7 +15,6 @@ from scipy.io import loadmat
 from scipy.stats import ttest_1samp
 from statsmodels.stats.multitest import multipletests
 
-
 # %%
 def _asarray_filled(data, dtype=np.float32):
     if isinstance(data, np.ma.MaskedArray):
@@ -262,7 +261,7 @@ def apply_empca(bold_clean):
     np.save(f'empca_model_sub{sub}_ses{ses}.npy', m)
     return m
 
-def prepare_data_func(bold_clean, beta_clean, behavioral_matrix, nan_mask_flat, active_coords, trial_length, num_trials):
+def prepare_data_func(bold_clean, beta_clean, behavioral_matrix, nan_mask_flat, active_coords, active_flat_indices, trial_length, num_trials):
     pca_model = apply_empca(bold_clean)
     bold_pca_components = pca_model.eigvec
     print(f"bold_pca_components: {bold_pca_components.shape}")
@@ -289,10 +288,10 @@ def prepare_data_func(bold_clean, beta_clean, behavioral_matrix, nan_mask_flat, 
     beta_observed = beta_pca[:, trial_mask]
     beta_centered = beta_observed - np.mean(beta_observed, axis=1, keepdims=True)
 
-    return {"nan_mask_flat": nan_mask_flat, "active_coords": tuple(np.array(coord) for coord in active_coords),
+    return {"nan_mask_flat": nan_mask_flat, "active_coords": tuple(np.array(coord) for coord in active_coords), "active_flat_indices": active_flat_indices,
         "coeff_pinv": coeff_pinv, "beta_centered": beta_centered, "behavior_centered": behavior_centered, 
         "normalized_behaviors": normalized_behaviors, "behavior_observed": behavior_observed, "beta_observed": beta_observed,
-        "beta_clean": beta_clean, "C_task": C_task, "C_bold": C_bold, "C_beta": C_beta, "active_bold": bold_clean,}, pca_model
+        "beta_clean": beta_clean, "C_task": C_task, "C_bold": C_bold, "C_beta": C_beta, "active_bold": bold_clean}, pca_model
 
 def calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta):
     beta_centered = run_data["beta_centered"]
@@ -371,25 +370,25 @@ def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, solver_name,
     return {"weights": solution_weights, "branch": solution_branch, "total_loss": total_loss, "Y": y,
             "objective_positive": objective_positive, "objective_negative": objective_negative, "penalty_contributions": contributions}
 
-# def evaluate_projection(run_data, weights):
-#     beta_centered = run_data["beta_centered"]
-#     behavior_centered = run_data["behavior_centered"]
-#     normalized_behaviors = run_data["normalized_behaviors"]
+def evaluate_projection(data, weights):
+    beta_centered = data["beta_centered"]
+    behavior_centered = data["behavior_centered"]
+    normalized_behaviors = data["normalized_behaviors"]
 
-#     projection = beta_centered.T @ weights
-#     finite_mask = np.isfinite(projection) & np.isfinite(behavior_centered)
-#     projection = projection[finite_mask]
-#     behavior_centered = behavior_centered[finite_mask]
-#     normalized_behaviors = normalized_behaviors[finite_mask]
+    projection = beta_centered.T @ weights
+    finite_mask = np.isfinite(projection) & np.isfinite(behavior_centered)
+    projection = projection[finite_mask]
+    behavior_centered = behavior_centered[finite_mask]
+    normalized_behaviors = normalized_behaviors[finite_mask]
 
-#     metrics = {"pearson": np.nan, "r2": np.nan, "mse": np.nan, "soc_slack": np.nan}
-#     metrics["pearson"] = _safe_pearsonr(projection, behavior_centered)
-#     residuals = behavior_centered - projection
-#     metrics["mse"] = np.mean(residuals**2)
-#     sst = np.sum(behavior_centered**2)
-#     metrics["r2"] = 1 - np.sum(residuals**2) / sst
+    metrics = {"pearson": np.nan, "r2": np.nan, "mse": np.nan, "soc_slack": np.nan}
+    metrics["pearson"] = _safe_pearsonr(projection, behavior_centered)
+    residuals = behavior_centered - projection
+    metrics["mse"] = np.mean(residuals**2)
+    sst = np.sum(behavior_centered**2)
+    metrics["r2"] = 1 - np.sum(residuals**2) / sst
 
-#     return metrics
+    return metrics
 
 # def summarize_bootstrap(values, reference=0.0, direction="less"):
 #     values_array = _asarray_filled(values, dtype=np.float64)
@@ -508,25 +507,24 @@ def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, solver_name,
 #     plt.close(fig)
 #     return output_path
 
-# def _reshape_projection(y_values, trial_length):
-#     y_values = np.asarray(y_values, dtype=np.float64).ravel()
-#     num_trials = y_values.size // trial_length
-#     return y_values, y_values.reshape(num_trials, trial_length)
+
 
 def _compute_weighted_active_bold_projection(voxel_weights, data):
     active_bold = data.get("active_bold")
-    # active_flat_indices = data.get("active_flat_indices")
+    active_flat_indices = data.get("active_flat_indices")
     nan_mask_flat = data.get("nan_mask_flat")
+
     voxel_weights = voxel_weights.ravel()
-    positions = nan_mask_flat     # I am not sure this part is correct.
-    # valid_flat_indices = np.flatnonzero(~np.asarray(nan_mask_flat, dtype=bool).ravel())
-    # positions = np.searchsorted(valid_flat_indices, np.asarray(active_flat_indices).ravel())
+    active_flat_indices = active_flat_indices.ravel()
+    valid_flat_indices = np.flatnonzero(~np.asarray(nan_mask_flat, dtype=bool).ravel())
+    positions = np.searchsorted(valid_flat_indices, active_flat_indices)
 
     active_voxel_weights = voxel_weights[positions]
     active_bold = _asarray_filled(active_bold, dtype=np.float64)
     bold_matrix = active_bold.reshape(active_bold.shape[0], -1).copy()
     with np.errstate(invalid="ignore"):
         voxel_means = np.nanmean(bold_matrix, axis=1, keepdims=True)
+
     voxel_means = np.where(np.isfinite(voxel_means), voxel_means, 0.0)
     bold_matrix -= voxel_means
     timepoints = bold_matrix.shape[1]
@@ -540,16 +538,16 @@ def _compute_weighted_active_bold_projection(voxel_weights, data):
         projection[t_idx] = np.dot(active_voxel_weights[voxel_mask], bold_matrix[voxel_mask, t_idx])
     return projection, bold_matrix
 
-# def _resolve_trial_metric(metric):
-#     if metric is None:
-#         return np.nanmean
-#     if callable(metric):
-#         return metric
-#     metric_key = str(metric).strip().lower()
-#     if metric_key in ("", "mean", "nanmean"):
-#         return np.nanmean
-#     if metric_key in ("median", "nanmedian"):
-#         return np.nanmedian
+def _resolve_trial_metric(metric):
+    if metric is None:
+        return np.nanmean
+    if callable(metric):
+        return metric
+    metric_key = str(metric).strip().lower()
+    if metric_key in ("", "mean", "nanmean"):
+        return np.nanmean
+    if metric_key in ("median", "nanmedian"):
+        return np.nanmedian
 
 def _describe_trial_metric(metric):
     if metric is None:
@@ -576,58 +574,58 @@ def _safe_pearsonr(x, y):
         return np.nan
     return float(np.dot(x, y) / denom)
 
-# def _aggregate_trials(active_bold, reducer):
-#     # downsample bold data by reducer metrice
-#     bold_trials = _asarray_filled(active_bold, dtype=np.float64)
-#     num_voxels, num_trials, trial_length = bold_trials.shape
-#     reshaped = bold_trials.reshape(-1, trial_length)
-#     finite_counts = np.count_nonzero(np.isfinite(reshaped), axis=1)
-#     valid_mask = finite_counts > 0
-#     reduced_flat = np.full(reshaped.shape[0], np.nan, dtype=np.float64)
+def _aggregate_trials(active_bold, reducer):
+    # downsample bold data by reducer metrice
+    bold_trials = _asarray_filled(active_bold, dtype=np.float64)
+    num_voxels, num_trials, trial_length = bold_trials.shape
+    reshaped = bold_trials.reshape(-1, trial_length)
+    finite_counts = np.count_nonzero(np.isfinite(reshaped), axis=1)
+    valid_mask = finite_counts > 0
+    reduced_flat = np.full(reshaped.shape[0], np.nan, dtype=np.float64)
 
-#     if np.any(valid_mask):
-#         valid_values = reshaped[valid_mask]
-#         reduced_values = reducer(valid_values, axis=-1)
-#         reduced_flat[valid_mask] = np.asarray(reduced_values, dtype=np.float64).ravel()
-#     return reduced_flat.reshape(num_voxels, num_trials)
+    if np.any(valid_mask):
+        valid_values = reshaped[valid_mask]
+        reduced_values = reducer(valid_values, axis=-1)
+        reduced_flat[valid_mask] = np.asarray(reduced_values, dtype=np.float64).ravel()
+    return reduced_flat.reshape(num_voxels, num_trials)
 
-# def compute_component_active_beta_correlation(voxel_weights, run_data, aggregation="median"):
-#     # corr(weight * beta, bold)
-#     active_beta = run_data.get("active_beta")
-#     active_bold = run_data.get("active_bold")
+def compute_component_active_beta_correlation(voxel_weights, data, aggregation="median"):
+    # corr(weight * beta, bold)
+    active_beta = data.get("beta_clean")
+    active_bold = data.get("active_bold")
 
-#     active_flat_indices = run_data.get("active_flat_indices")
-#     nan_mask_flat = run_data.get("nan_mask_flat")
-#     active_flat_indices = np.asarray(active_flat_indices).ravel()
-#     voxel_weights = np.asarray(voxel_weights, dtype=np.float64).ravel()
-#     valid_flat_indices = np.flatnonzero(~np.asarray(nan_mask_flat, dtype=bool).ravel())
-#     positions = np.searchsorted(valid_flat_indices, active_flat_indices)
+    active_flat_indices = data.get("active_flat_indices")
+    nan_mask_flat = data.get("nan_mask_flat")
+    active_flat_indices = np.asarray(active_flat_indices).ravel()
+    voxel_weights = np.asarray(voxel_weights, dtype=np.float64).ravel()
+    valid_flat_indices = np.flatnonzero(~np.asarray(nan_mask_flat, dtype=bool).ravel())
+    positions = np.searchsorted(valid_flat_indices, active_flat_indices)
 
-#     active_voxel_weights = voxel_weights[positions]
-#     beta_matrix = _asarray_filled(active_beta, dtype=np.float64)
+    active_voxel_weights = voxel_weights[positions]
+    beta_matrix = _asarray_filled(active_beta, dtype=np.float64)
 
-#     reducer = _resolve_trial_metric(aggregation)
-#     bold_trial_metric = _aggregate_trials(active_bold, reducer)
+    reducer = _resolve_trial_metric(aggregation)
+    bold_trial_metric = _aggregate_trials(active_bold, reducer)
 
-#     num_trials = beta_matrix.shape[1]
-#     projection = np.full(num_trials, np.nan, dtype=np.float64)
-#     finite_mask = np.isfinite(beta_matrix)
+    num_trials = beta_matrix.shape[1]
+    projection = np.full(num_trials, np.nan, dtype=np.float64)
+    finite_mask = np.isfinite(beta_matrix)
 
-#     for trial_idx in range(num_trials):
-#         voxel_mask = finite_mask[:, trial_idx]
-#         if not np.any(voxel_mask):
-#             continue
-#         projection[trial_idx] = np.dot(active_voxel_weights[voxel_mask], beta_matrix[voxel_mask, trial_idx])
+    for trial_idx in range(num_trials):
+        voxel_mask = finite_mask[:, trial_idx]
+        if not np.any(voxel_mask):
+            continue
+        projection[trial_idx] = np.dot(active_voxel_weights[voxel_mask], beta_matrix[voxel_mask, trial_idx])
 
-#     correlations = np.full(beta_matrix.shape[0], np.nan, dtype=np.float32)
-#     projection_finite = np.isfinite(projection)
-#     for voxel_idx, voxel_series in enumerate(bold_trial_metric):
-#         voxel_finite = np.isfinite(voxel_series)
-#         joint_mask = projection_finite & voxel_finite
-#         if np.count_nonzero(joint_mask) < 2:
-#             continue
-#         correlations[voxel_idx] = _safe_pearsonr(projection[joint_mask], voxel_series[joint_mask])
-#     return projection, correlations
+    correlations = np.full(beta_matrix.shape[0], np.nan, dtype=np.float32)
+    projection_finite = np.isfinite(projection)
+    for voxel_idx, voxel_series in enumerate(bold_trial_metric):
+        voxel_finite = np.isfinite(voxel_series)
+        joint_mask = projection_finite & voxel_finite
+        if np.count_nonzero(joint_mask) < 2:
+            continue
+        correlations[voxel_idx] = _safe_pearsonr(projection[joint_mask], voxel_series[joint_mask])
+    return projection, correlations
 
 def compute_component_active_bold_correlation(voxel_weights, data):
     # corr(weight * bold, bold)
@@ -668,112 +666,97 @@ def save_active_bold_correlation_map(correlations, active_coords, volume_shape, 
         display.save_as_html(f"{result_prefix}_{file_prefix}.html")
     return
 
-# def plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, output_path, max_trials=10, series_label=None):
-#     num_trials_total, trial_length = y_trials.shape
-#     time_axis = np.arange(trial_length)
-#     fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
-#     trial_windows = [(10, 20), (40, 50)]
-#     window_titles = ["Trials 10-20", "Trials 40-50"]
+def plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, output_path, max_trials=10, series_label=None):
+    num_trials_total, trial_length = y_trials.shape
+    time_axis = np.arange(trial_length)
+    fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
+    trial_windows = [(10, 20), (40, 50)]
+    window_titles = ["Trials 10-20", "Trials 40-50"]
 
-#     def _get_light_colors(count):
-#         cmap = plt.cm.get_cmap("tab20", count)
-#         raw_colors = cmap(np.linspace(0, 1, count))
-#         pastel = raw_colors * 0.55 + 0.45
-#         return np.clip(pastel, 0.0, 1.0)
+    def _get_light_colors(count):
+        cmap = plt.cm.get_cmap("tab20", count)
+        raw_colors = cmap(np.linspace(0, 1, count))
+        pastel = raw_colors * 0.55 + 0.45
+        return np.clip(pastel, 0.0, 1.0)
 
-#     for ax, (start, end), window_title in zip(axes, trial_windows, window_titles):
-#         start_idx = min(start, num_trials_total)
-#         end_idx = min(end, num_trials_total)
-#         window_trials = y_trials[start_idx:end_idx]
-#         trials_to_plot = window_trials[:max_trials]
-#         colors = _get_light_colors(trials_to_plot.shape[0])
-#         for trial_offset, (trial_values, color) in enumerate(zip(trials_to_plot, colors)):
-#             label = f"Trial {start_idx + trial_offset + 1}"
-#             ax.plot(time_axis, trial_values, linewidth=1.0, color=color, alpha=0.9, label=label)
+    for ax, (start, end), window_title in zip(axes, trial_windows, window_titles):
+        start_idx = min(start, num_trials_total)
+        end_idx = min(end, num_trials_total)
+        window_trials = y_trials[start_idx:end_idx]
+        trials_to_plot = window_trials[:max_trials]
+        colors = _get_light_colors(trials_to_plot.shape[0])
+        for trial_offset, (trial_values, color) in enumerate(zip(trials_to_plot, colors)):
+            label = f"Trial {start_idx + trial_offset + 1}"
+            ax.plot(time_axis, trial_values, linewidth=1.0, color=color, alpha=0.9, label=label)
 
-#         ax.set_ylabel("BOLD projection")
-#         ax.set_title(window_title)
-#         ax.grid(True, linestyle="--", alpha=0.25)
-#         ax.legend(loc="upper right", fontsize=8, ncol=2)
+        ax.set_ylabel("BOLD projection")
+        ax.set_title(window_title)
+        ax.grid(True, linestyle="--", alpha=0.25)
+        ax.legend(loc="upper right", fontsize=8, ncol=2)
 
-#     axes[-1].set_xlabel("Time point")
-#     label_suffix = f" [{series_label}]" if series_label else ""
-#     fig.suptitle(f"y | alpha_task={task_alpha:g}, alpha_bold={bold_alpha:g}, alpha_beta={beta_alpha:g}, rho={rho_value:g}{label_suffix}",fontsize=13)
-#     fig.tight_layout(rect=[0, 0, 1, 0.95])
-#     fig.savefig(output_path, dpi=300)
-#     plt.close(fig)
-#     return output_path
+    axes[-1].set_xlabel("Time point")
+    label_suffix = f" [{series_label}]" if series_label else ""
+    fig.suptitle(f"y | alpha_task={task_alpha:g}, alpha_bold={bold_alpha:g}, alpha_beta={beta_alpha:g}, rho={rho_value:g}{label_suffix}",fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+    return output_path
 
-# def plot_projection_beta(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, output_path, series_label=None):
-#     # y = w*beta
-#     y_trials = np.asarray(y_trials, dtype=np.float64).ravel()
-#     num_trials = y_trials.size
-#     time_axis = np.arange(num_trials)
-#     fig_height = 5.0 if num_trials <= 120 else 6.5
+def plot_projection_beta_sweep(rho_projection_series, task_alpha, bold_alpha, beta_alpha, output_path, series_label=None):
+    if not rho_projection_series:
+        return None
+    sorted_series = sorted(rho_projection_series, key=lambda item: item[0])
+    max_trials = max(np.asarray(series, dtype=np.float64).ravel().size for _, series in sorted_series)
+    fig_height = 5.0 if max_trials <= 120 else 6.5
+    time_axis = np.arange(max_trials)
+    cmap = plt.cm.get_cmap("tab10", len(sorted_series))
 
-#     fig, ax = plt.subplots(figsize=(10, fig_height))
-#     ax.plot(time_axis, y_trials, linewidth=1.4, alpha=0.95, color="#1f77b4", marker="o", markersize=3)
+    fig, ax = plt.subplots(figsize=(10, fig_height))
+    for idx, (rho_value, projection) in enumerate(sorted_series):
+        y_trials = np.asarray(projection, dtype=np.float64).ravel()
+        trial_axis = time_axis[: y_trials.size]
+        ax.plot(trial_axis, y_trials, linewidth=1.2, alpha=0.9, label=f"rho={rho_value:g}", color=cmap(idx))
 
-#     ax.set_xlabel("Trial index")
-#     ax.set_ylabel("Voxel-space projection")
-#     label_suffix = f" [{series_label}]" if series_label else ""
-#     ax.set_title(f"y_beta | alpha_task={task_alpha:g}, alpha_bold={bold_alpha:g}, alpha_beta={beta_alpha:g}, rho={rho_value:g}{label_suffix}")
-#     ax.grid(True, linestyle="--", alpha=0.3)
-#     fig.tight_layout()
-#     fig.savefig(output_path, dpi=300)
-#     plt.close(fig)
-#     return output_path
+    ax.set_xlabel("Trial index")
+    ax.set_ylabel("Voxel-space projection")
+    label_suffix = f" [{series_label}]" if series_label else ""
+    rho_labels = ", ".join(f"{rho:g}" for rho, _ in sorted_series)
+    ax.set_title(f"y_beta across rhos ({rho_labels}) | alpha_task={task_alpha:g}, alpha_bold={bold_alpha:g}, alpha_beta={beta_alpha:g}{label_suffix}")
+    ax.grid(True, linestyle="--", alpha=0.3)
+    ax.legend(loc="best", fontsize=9, ncol=2)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+    return output_path
 
-# def plot_projection_beta_sweep(rho_projection_series, task_alpha, bold_alpha, beta_alpha, output_path, series_label=None):
-#     if not rho_projection_series:
-#         return None
-#     sorted_series = sorted(rho_projection_series, key=lambda item: item[0])
-#     max_trials = max(np.asarray(series, dtype=np.float64).ravel().size for _, series in sorted_series)
-#     fig_height = 5.0 if max_trials <= 120 else 6.5
-#     time_axis = np.arange(max_trials)
-#     cmap = plt.cm.get_cmap("tab10", len(sorted_series))
+def _reshape_projection(y_values, trial_length):
+    y_values = np.asarray(y_values, dtype=np.float64).ravel()
+    num_trials = y_values.size // trial_length
+    return y_values, y_values.reshape(num_trials, trial_length)
 
-#     fig, ax = plt.subplots(figsize=(10, fig_height))
-#     for idx, (rho_value, projection) in enumerate(sorted_series):
-#         y_trials = np.asarray(projection, dtype=np.float64).ravel()
-#         trial_axis = time_axis[: y_trials.size]
-#         ax.plot(trial_axis, y_trials, linewidth=1.2, alpha=0.9, label=f"rho={rho_value:g}", color=cmap(idx))
+def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file_prefix,
+                            task_alpha, bold_alpha, beta_alpha, rho_value, voxel_weights, beta_clean,
+                            data=None, bold_projection=None):
 
-#     ax.set_xlabel("Trial index")
-#     ax.set_ylabel("Voxel-space projection")
-#     label_suffix = f" [{series_label}]" if series_label else ""
-#     rho_labels = ", ".join(f"{rho:g}" for rho, _ in sorted_series)
-#     ax.set_title(f"y_beta across rhos ({rho_labels}) | alpha_task={task_alpha:g}, alpha_bold={bold_alpha:g}, alpha_beta={beta_alpha:g}{label_suffix}")
-#     ax.grid(True, linestyle="--", alpha=0.3)
-#     ax.legend(loc="best", fontsize=9, ncol=2)
-#     fig.tight_layout()
-#     fig.savefig(output_path, dpi=300)
-#     plt.close(fig)
-#     return output_path
+    # component_weights = pca_weights.ravel()
+    # y_projection_pc = component_weights @ bold_pca_components
+    # np.save(f"y_projection_{file_prefix}.npy", y_projection_pc)
+    # _, y_trials = _reshape_projection(y_projection_pc, trial_length)
+    # plot_path = f"y_projection_trials_{file_prefix}.png"
+    # plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, plot_path, series_label="PC space")
 
-# def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file_prefix,
-#                             task_alpha, bold_alpha, beta_alpha, rho_value, voxel_weights, beta_volume_clean,
-#                             run_data=None, bold_projection=None):
+    bold_projection_signal, _ = _compute_weighted_active_bold_projection(voxel_weights, data)
+    # np.save(f"y_projection_{file_prefix}.npy", bold_projection_signal)
+    _, y_trials = _reshape_projection(bold_projection_signal, trial_length)
+    plot_path = f"y_projection_trials_{file_prefix}.png"
+    plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, plot_path, series_label="Active BOLD space")
 
-#     # component_weights = pca_weights.ravel()
-#     # y_projection_pc = component_weights @ bold_pca_components
-#     # np.save(f"y_projection_{file_prefix}.npy", y_projection_pc)
-#     # _, y_trials = _reshape_projection(y_projection_pc, trial_length)
-#     # plot_path = f"y_projection_trials_{file_prefix}.png"
-#     # plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, plot_path, series_label="PC space")
-
-#     bold_projection_signal, _ = _compute_weighted_active_bold_projection(voxel_weights, run_data)
-#     # np.save(f"y_projection_{file_prefix}.npy", bold_projection_signal)
-#     _, y_trials = _reshape_projection(bold_projection_signal, trial_length)
-#     plot_path = f"y_projection_trials_{file_prefix}.png"
-#     plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, plot_path, series_label="Active BOLD space")
-
-#     voxel_weights = voxel_weights.ravel()
-#     beta_matrix = np.nan_to_num(beta_volume_clean, nan=0.0, posinf=0.0, neginf=0.0)
-#     y_projection_voxel_trials = voxel_weights @ beta_matrix
-#     y_projection_voxel = y_projection_voxel_trials.ravel()
-#     # np.save(f"y_projection_voxel_{file_prefix}.npy", y_projection_voxel)
-#     return y_projection_voxel
+    voxel_weights = voxel_weights.ravel()
+    beta_matrix = np.nan_to_num(beta_clean, nan=0.0, posinf=0.0, neginf=0.0)
+    y_projection_voxel_trials = voxel_weights @ beta_matrix
+    y_projection_voxel = y_projection_voxel_trials.ravel()
+    # np.save(f"y_projection_voxel_{file_prefix}.npy", y_projection_voxel)
+    return y_projection_voxel
 # # %%
 ridge_penalty = 1e-6
 solver_name = "MOSEK"
@@ -795,7 +778,7 @@ metric_label = _describe_trial_metric(trial_downsample_metric).replace(" ", "_")
 
 
 def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
-    data, pca_model = prepare_data_func(bold_clean, beta_clean, behavior_matrix, nan_mask_flat, active_coords, trial_len, num_trials)
+    data, pca_model = prepare_data_func(bold_clean, beta_clean, behavior_matrix, nan_mask_flat, active_coords, active_flat_idx, trial_len, num_trials)
     bold_pca_components = pca_model.eigvec
 
     for alpha_setting in alpha_settings:
@@ -827,35 +810,32 @@ def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
 
             projection_signal, voxel_correlations = compute_component_active_bold_correlation(voxel_weights, data) 
 #             # np.save(f"component_active_bold_projection_{file_prefix}.npy", projection_signal)
+            save_active_bold_correlation_map(voxel_correlations, data.get("active_coords"), anat_img.shape[:3], anat_img, file_prefix)
 
-#             save_active_bold_correlation_map(voxel_correlations, train_data.get("active_coords"), beta_volume_filter_train.shape[:3], anat_img, file_prefix)
-
-#             beta_projection_signal = None
-#             beta_voxel_correlations = None
-#             beta_projection_signal, beta_voxel_correlations = compute_component_active_beta_correlation(voxel_weights, train_data, aggregation=trial_downsample_metric)
+            beta_projection_signal = None
+            beta_voxel_correlations = None
+            beta_projection_signal, beta_voxel_correlations = compute_component_active_beta_correlation(voxel_weights, data, aggregation=trial_downsample_metric)
 #             # np.save(f"component_active_beta_projection_{metric_label}_{file_prefix}.npy", beta_projection_signal)
-#             save_active_bold_correlation_map(beta_voxel_correlations, train_data.get("active_coords"),
-#                                              beta_volume_filter_train.shape[:3], anat_img, file_prefix,
-#                                              result_prefix=f"active_beta_corr_{metric_label}")
+            save_active_bold_correlation_map(beta_voxel_correlations, data.get("active_coords"), anat_img.shape[:3], anat_img, file_prefix, result_prefix=f"active_beta_corr_{metric_label}")
 
-#             y_projection_voxel = save_projection_outputs(component_weights, bold_pca_components, trial_len, file_prefix, 
-#                                                          task_alpha, bold_alpha, beta_alpha, rho_value,
-#                                                          voxel_weights=voxel_weights, beta_volume_clean=beta_volume_clean,
-#                                                          run_data=train_data, bold_projection=projection_signal)
-#             rho_projection_series.append((rho_value, y_projection_voxel))
+            y_projection_voxel = save_projection_outputs(component_weights, bold_pca_components, trial_len, file_prefix, 
+                                                         task_alpha, bold_alpha, beta_alpha, rho_value,
+                                                         voxel_weights=voxel_weights, beta_clean=beta_clean,
+                                                         data= data, bold_projection=projection_signal)
+            rho_projection_series.append((rho_value, y_projection_voxel))
 
-#             train_metrics = evaluate_projection(train_data, component_weights)
-#             test_metrics = evaluate_projection(test_data, component_weights)
+            train_metrics = evaluate_projection(data, component_weights)
+            test_metrics = evaluate_projection(data, component_weights)
 
-#             print(f"  Solution branch: {solution['branch']}", flush=True)
-#             print(f"  Penalty contributions: {solution['penalty_contributions']}", flush=True)
-#             print(f"  Total loss (train objective): {solution['total_loss']:.6f}", flush=True)
-#             print(f"  Train metrics -> corr: {train_metrics['pearson']:.4f}, R2: {train_metrics['r2']:.4f}", flush=True)
-#             print(f"  Test metrics  -> corr: {test_metrics['pearson']:.4f}, R2: {test_metrics['r2']:.4f}", flush=True)
+            print(f"  Solution branch: {solution['branch']}", flush=True)
+            print(f"  Penalty contributions: {solution['penalty_contributions']}", flush=True)
+            print(f"  Total loss (train objective): {solution['total_loss']:.6f}", flush=True)
+            print(f"  Train metrics -> corr: {train_metrics['pearson']:.4f}, R2: {train_metrics['r2']:.4f}", flush=True)
+            print(f"  Test metrics  -> corr: {test_metrics['pearson']:.4f}, R2: {test_metrics['r2']:.4f}", flush=True)
 
-#             if bootstrap_samples > 0:
-#                 # print(f"  Running weight-shuffle analysis with {bootstrap_samples} samples...", flush=True)
-#                 shuffle_results = perform_weight_shuffle_tests(train_data, test_data, component_weights, task_alpha, bold_alpha, beta_alpha, rho_value, num_samples=bootstrap_samples)
+            if bootstrap_samples > 0:
+                print(f"  Running weight-shuffle analysis with {bootstrap_samples} samples...", flush=True)
+                shuffle_results = perform_weight_shuffle_tests(train_data, test_data, component_weights, task_alpha, bold_alpha, beta_alpha, rho_value, num_samples=bootstrap_samples)
 
 #                 succeeded = shuffle_results["num_successful"]
 #                 requested = shuffle_results["num_requested"]
@@ -922,9 +902,9 @@ def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
 #                     # if created_path:
 #                         # print(f"    Saved total loss shuffle plot to {created_path}", flush=True)
 
-#         if rho_projection_series:
-#             aggregate_plot_path = f"y_projection_trials_voxel_{alpha_prefix}_all_rhos.png"
-#             plot_projection_beta_sweep(rho_projection_series, task_alpha, bold_alpha, beta_alpha, aggregate_plot_path, series_label="Voxel space")
+        if rho_projection_series:
+            aggregate_plot_path = f"y_projection_trials_voxel_{alpha_prefix}_all_rhos.png"
+            plot_projection_beta_sweep(rho_projection_series, task_alpha, bold_alpha, beta_alpha, aggregate_plot_path, series_label="Voxel space")
 
 
 if __name__ == "__main__":
