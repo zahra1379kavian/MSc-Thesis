@@ -1,6 +1,7 @@
 # Combine Run 1 & 2
 import argparse
 import os
+from collections import defaultdict
 from itertools import product
 from os.path import join
 from empca.empca.empca import empca
@@ -326,6 +327,9 @@ def prepare_data_func(projection_data, trial_indices, trial_length, run_boundary
     behavior_centered = behavior_observed - behavior_mean
     behavior_norm = np.linalg.norm(behavior_centered)
     print(f"behavior_norm: {behavior_norm}")
+    if not np.isfinite(behavior_norm) or behavior_norm <= 0:
+        print("behavior_norm is zero or non-finite; using 1.0 to avoid division errors.", flush=True)
+        behavior_norm = 1.0
     normalized_behaviors = behavior_centered / behavior_norm
 
     beta_observed = beta_pca[:, trial_mask]
@@ -516,11 +520,10 @@ def perform_weight_shuffle_tests(train_data, test_data, weights, task_alpha, bol
     correlation_summary = {"train": summarize_bootstrap(train_corr_array, reference=baseline_train_corr, direction=train_direction),
                            "test": summarize_bootstrap(test_corr_array, reference=baseline_test_corr, direction=test_direction)}
 
-    num_successful = int(np.count_nonzero(np.isfinite(test_corr_array)))
-    num_failed = int(num_samples - num_successful)
+    # num_successful = int(np.count_nonzero(np.isfinite(test_corr_array)))
+    # num_failed = int(num_samples - num_successful)
 
     return {"penalties": penalty_summary, "total_loss": total_loss_summary, "correlation": correlation_summary, 
-            "num_requested": num_samples, "num_successful": num_successful, "num_failed": num_failed,
             "penalty_samples": penalty_arrays, "total_loss_samples": total_loss_array, "correlation_samples": {"train": train_corr_array, "test": test_corr_array}}
 
 def plot_bootstrap_distribution(samples, actual_value, p_value, title, xlabel, output_path):
@@ -810,7 +813,6 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
 # # %%
 ridge_penalty = 1e-6
 solver_name = "MOSEK"
-soc_ratio = 0.95
 
 # task_penalty_sweep = [0.0, 0.5, 100.0]
 # bold_penalty_sweep = [0.0, 0.25, 100.0]
@@ -861,6 +863,12 @@ def build_custom_kfold_splits(total_trials, num_folds=5, trials_per_run=None):
 def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection_data, bootstrap_samples=0):
     total_folds = len(fold_splits)
     bold_pca_components_full = projection_data["pca_model"].eigvec
+    aggregate_metrics = defaultdict(lambda: {"train_corr": [], "train_r2": [], "test_corr": [], "test_r2": []})
+
+    def _append_if_finite(target_list, value):
+        if np.isfinite(value):
+            target_list.append(float(value))
+
     for fold_idx, split in enumerate(fold_splits, start=1):
         print(f"\n===== Fold {fold_idx}/{total_folds} =====", flush=True)
         test_indices = split["test_indices"]
@@ -915,13 +923,20 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
                 print(f"  Train metrics -> corr: {train_metrics['pearson']:.4f}, R2: {train_metrics['r2']:.4f}", flush=True)
                 print(f"  Test metrics  -> corr: {test_metrics['pearson']:.4f}, R2: {test_metrics['r2']:.4f}", flush=True)
 
+                metrics_key = (task_alpha, bold_alpha, beta_alpha, rho_value)
+                bucket = aggregate_metrics[metrics_key]
+                _append_if_finite(bucket["train_corr"], train_metrics["pearson"])
+                _append_if_finite(bucket["train_r2"], train_metrics["r2"])
+                _append_if_finite(bucket["test_corr"], test_metrics["pearson"])
+                _append_if_finite(bucket["test_r2"], test_metrics["r2"])
+
                 if bootstrap_samples > 0:
                     print(f"  Running weight-shuffle analysis with {bootstrap_samples} samples...", flush=True)
                     shuffle_results = perform_weight_shuffle_tests(train_data, test_data, component_weights, task_alpha, bold_alpha, beta_alpha, rho_value, num_samples=bootstrap_samples)
 
-                    succeeded = shuffle_results["num_successful"]
-                    requested = shuffle_results["num_requested"]
-                    failed = shuffle_results["num_failed"]
+                    # succeeded = shuffle_results["num_successful"]
+                    # requested = shuffle_results["num_requested"]
+                    # failed = shuffle_results["num_failed"]
                     # print(f"    Weight-shuffle successes: {succeeded}/{requested} (failed: {failed})", flush=True)
 
                     def format_float(value, digits):
@@ -987,6 +1002,24 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
         if rho_projection_series:
             aggregate_plot_path = f"y_projection_trials_voxel_{alpha_prefix}_all_rhos.png"
             plot_projection_beta_sweep(rho_projection_series, task_alpha, bold_alpha, beta_alpha, aggregate_plot_path, series_label="Voxel space")
+
+    if aggregate_metrics:
+        print("\n===== Cross-fold average metrics =====", flush=True)
+        def _safe_mean(values):
+            return float(np.mean(values)) if values else np.nan
+
+        for metrics_key in sorted(aggregate_metrics.keys()):
+            task_alpha, bold_alpha, beta_alpha, rho_value = metrics_key
+            bucket = aggregate_metrics[metrics_key]
+            train_corr_mean = _safe_mean(bucket["train_corr"])
+            train_r2_mean = _safe_mean(bucket["train_r2"])
+            test_corr_mean = _safe_mean(bucket["test_corr"])
+            test_r2_mean = _safe_mean(bucket["test_r2"])
+            fold_count = len(bucket["test_corr"])
+            print(f"task={task_alpha:g}, bold={bold_alpha:g}, beta={beta_alpha:g}, rho={rho_value:g} "
+                f"(folds contributing={fold_count}): "
+                f"train corr={train_corr_mean:.4f}, test corr={test_corr_mean:.4f}, "
+                f"train R2={train_r2_mean:.4f}, test R2={test_r2_mean:.4f}", flush=True)
 
 if __name__ == "__main__":
 #     parser = argparse.ArgumentParser(description="Run a subset of alpha/rho sweeps.")
