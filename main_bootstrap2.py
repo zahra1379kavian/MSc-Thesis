@@ -864,10 +864,39 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
     total_folds = len(fold_splits)
     bold_pca_components_full = projection_data["pca_model"].eigvec
     aggregate_metrics = defaultdict(lambda: {"train_corr": [], "train_r2": [], "test_corr": [], "test_r2": []})
+    fold_output_tracker = defaultdict(lambda: {
+        "voxel_weights": [],
+        "voxel_weights_shape": None,
+        "bold_corr": [],
+        "bold_corr_shape": None,
+        "beta_corr": [],
+        "beta_corr_shape": None,
+        "projection": [],
+        "projection_shape": None,
+    })
 
     def _append_if_finite(target_list, value):
         if np.isfinite(value):
             target_list.append(float(value))
+
+    def _append_fold_array(container, field, values, combo_label):
+        arr = np.asarray(values, dtype=np.float64).ravel()
+        shape_key = f"{field}_shape"
+        existing_shape = container.get(shape_key)
+        if existing_shape is None:
+            container[shape_key] = arr.shape
+        elif existing_shape != arr.shape:
+            print(f"Skipping accumulation of {field} for {combo_label} due to shape mismatch "
+                  f"{arr.shape} vs {existing_shape}", flush=True)
+            return
+        container[field].append(arr)
+
+    def _stack_nanmean(values):
+        if not values:
+            return None
+        stacked = np.stack(values, axis=0)
+        with np.errstate(invalid="ignore"):
+            return np.nanmean(stacked, axis=0)
 
     for fold_idx, split in enumerate(fold_splits, start=1):
         print(f"\n===== Fold {fold_idx}/{total_folds} =====", flush=True)
@@ -889,6 +918,9 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
             alpha_prefix = f"fold{fold_idx}_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}"
 
             for rho_value in rho_values:
+                metrics_key = (task_alpha, bold_alpha, beta_alpha, rho_value)
+                combo_label = (f"task={task_alpha:g}, bold={bold_alpha:g}, "
+                               f"beta={beta_alpha:g}, rho={rho_value:g}")
                 sweep_suffix = f"{alpha_prefix}_rho{rho_value:g}"
                 print(f"Fold {fold_idx}: optimization with task={task_alpha}, bold={bold_alpha}, beta={beta_alpha}, rho={rho_value}", flush=True)
                 solution = solve_soc_problem(train_data, task_alpha, bold_alpha, beta_alpha, solver_name, rho_value)
@@ -913,6 +945,11 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
                                                              voxel_weights=voxel_weights, beta_clean=train_data["beta_clean"],
                                                              data=train_data, bold_projection=projection_signal)
                 rho_projection_series.append((rho_value, y_projection_voxel))
+                fold_outputs = fold_output_tracker[metrics_key]
+                _append_fold_array(fold_outputs, "voxel_weights", voxel_weights, combo_label)
+                _append_fold_array(fold_outputs, "bold_corr", voxel_correlations, combo_label)
+                _append_fold_array(fold_outputs, "beta_corr", beta_voxel_correlations, combo_label)
+                _append_fold_array(fold_outputs, "projection", y_projection_voxel, combo_label)
 
                 train_metrics = evaluate_projection(train_data, component_weights)
                 test_metrics = evaluate_projection(test_data, component_weights)
@@ -1002,6 +1039,37 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
         if rho_projection_series:
             aggregate_plot_path = f"y_projection_trials_voxel_{alpha_prefix}_all_rhos.png"
             plot_projection_beta_sweep(rho_projection_series, task_alpha, bold_alpha, beta_alpha, aggregate_plot_path, series_label="Voxel space")
+
+    if fold_output_tracker:
+        print("\n===== Saving fold-averaged spatial maps and projections =====", flush=True)
+        active_coords = projection_data.get("active_coords") or ()
+        volume_shape = anat_img.shape[:3]
+        for metrics_key in sorted(fold_output_tracker.keys()):
+            task_alpha, bold_alpha, beta_alpha, rho_value = metrics_key
+            fold_outputs = fold_output_tracker[metrics_key]
+            avg_prefix = f"foldavg_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_rho{rho_value:g}"
+            weights_avg = _stack_nanmean(fold_outputs["voxel_weights"])
+            if weights_avg is not None:
+                save_active_bold_correlation_map(weights_avg, active_coords, volume_shape, anat_img, avg_prefix,
+                                                 result_prefix="voxel_weights")
+            bold_corr_avg = _stack_nanmean(fold_outputs["bold_corr"])
+            if bold_corr_avg is not None:
+                save_active_bold_correlation_map(bold_corr_avg, active_coords, volume_shape, anat_img, avg_prefix)
+            beta_corr_avg = _stack_nanmean(fold_outputs["beta_corr"])
+            if beta_corr_avg is not None:
+                save_active_bold_correlation_map(beta_corr_avg, active_coords, volume_shape, anat_img, avg_prefix,
+                                                 result_prefix=f"active_beta_corr_{metric_label}")
+            projection_avg = _stack_nanmean(fold_outputs["projection"])
+            if projection_avg is not None:
+                total_points = projection_avg.size
+                if total_points % trial_len == 0:
+                    _, avg_trials = _reshape_projection(projection_avg, trial_len)
+                    avg_plot_path = f"y_projection_trials_{avg_prefix}.png"
+                    plot_projection_bold(avg_trials, task_alpha, bold_alpha, beta_alpha, rho_value, avg_plot_path,
+                                         series_label="Voxel space (fold avg)")
+                else:
+                    print(f"Skipping projection averaging for task={task_alpha:g}, bold={bold_alpha:g}, "
+                          f"beta={beta_alpha:g}, rho={rho_value:g} due to incompatible length {total_points}", flush=True)
 
     if aggregate_metrics:
         print("\n===== Cross-fold average metrics =====", flush=True)
