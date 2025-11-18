@@ -94,6 +94,7 @@ sub = "04"
 num_trials = 180
 trial_len = 9
 behave_indice = 1 #1/RT
+trials_per_run = num_trials // 2
 
 base_path = "/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/"
 brain_mask_path = f"{base_path}/sub-pd0{sub}_ses-{ses}_T1w_brain_mask.nii.gz"
@@ -163,9 +164,15 @@ _, _, num_metrics = behav_block.shape
 behavior_matrix = behav_block.reshape(-1, num_metrics)
 print(f"Behavior matrix shape: {behavior_matrix.shape}")
 # %%
-def calcu_matrices_func(beta_pca, bold_pca, behave_mat, behave_indice, trial_len=trial_len, num_trials=180):
+def calcu_matrices_func(beta_pca, bold_pca, behave_mat, behave_indice, trial_len=trial_len,num_trials=180, trial_indices=None, run_boundary=None):
     bold_pca_reshape = bold_pca.reshape(bold_pca.shape[0], num_trials, trial_len)
     behavior_selected = behave_mat[:, behave_indice]
+    if trial_indices is None:
+        trial_indices = np.arange(num_trials, dtype=np.int64)
+    else:
+        trial_indices = np.asarray(trial_indices, dtype=np.int64)
+    if run_boundary is None:
+        run_boundary = num_trials // 2
 
     # print("L_task...", flush=True)
     counts = np.count_nonzero(np.isfinite(beta_pca), axis=-1)
@@ -181,24 +188,34 @@ def calcu_matrices_func(beta_pca, bold_pca, behave_mat, behave_indice, trial_len
 
     # print("L_var...", flush=True)
     C_bold = np.zeros((bold_pca_reshape.shape[0], bold_pca_reshape.shape[0]), dtype=np.float32)
+    bold_transition_count = 0
     for i in range(num_trials - 1):
-        if i== 89:
+        idx_current = trial_indices[i]
+        idx_next = trial_indices[i + 1]
+        if (idx_current < run_boundary) and (idx_next >= run_boundary):
             continue
         x1 = bold_pca_reshape[:, i, :]
         x2 = bold_pca_reshape[:, i + 1, :]
         C_bold += (x1 - x2) @ (x1 - x2).T
-    C_bold /= (num_trials - 2) #not considered the transition between runs
+        bold_transition_count += 1
+    if bold_transition_count > 0:
+        C_bold /= bold_transition_count
 
     # print("L_var...", flush=True)
     C_beta = np.zeros((beta_pca.shape[0], beta_pca.shape[0]), dtype=np.float32)
+    beta_transition_count = 0
     for i in range(num_trials - 1):
-        if i== 89:
+        idx_current = trial_indices[i]
+        idx_next = trial_indices[i + 1]
+        if (idx_current < run_boundary) and (idx_next >= run_boundary):
             continue
         x1 = beta_pca[:, i]
         x2 = beta_pca[:, i + 1]
         diff = x1 - x2
         C_beta += np.outer(diff, diff)
-    C_beta /= (num_trials - 2)
+        beta_transition_count += 1
+    if beta_transition_count > 0:
+        C_beta /= beta_transition_count
 
     return C_task, C_bold, C_beta, behavior_selected
 
@@ -261,22 +278,48 @@ def apply_empca(bold_clean):
     np.save(f'empca_model_sub{sub}_ses{ses}.npy', m)
     return m
 
-def prepare_data_func(bold_clean, beta_clean, behavioral_matrix, nan_mask_flat, active_coords, active_flat_indices, trial_length, num_trials):
-    pca_model = apply_empca(bold_clean)
-    bold_pca_components = pca_model.eigvec
-    print(f"bold_pca_components: {bold_pca_components.shape}")
-    coeff_pinv = np.linalg.pinv(pca_model.coeff)
-    beta_pca = coeff_pinv @ np.nan_to_num(beta_clean)
-    print(f"beta_pca: {beta_pca.shape}")
+def load_or_fit_empca_model(bold_clean):
+    model_path = f"empca_model_sub{sub}_ses{ses}.npy"
+    if os.path.exists(model_path):
+            print(f"Loading existing EMPCA model from {model_path}", flush=True)
+            return np.load(model_path, allow_pickle=True).item()
+    return apply_empca(bold_clean)
 
-    (C_task, C_bold, C_beta, behavior_vector) = calcu_matrices_func(beta_pca, bold_pca_components, behavioral_matrix, 
-                                                                    behave_indice, trial_len=trial_length, num_trials=num_trials)
+def build_projection_dataset(bold_clean, beta_clean, behavioral_matrix, nan_mask_flat, active_coords, active_flat_indices, trial_length, num_trials):
+    pca_model = load_or_fit_empca_model(bold_clean)
+    bold_pca_components = pca_model.eigvec
+    expected_points = num_trials * trial_length
+    if bold_pca_components.shape[1] != expected_points:
+        raise ValueError(f"PCA components ({bold_pca_components.shape[1]}) do not match expected trial length ({expected_points}).")
+    bold_pca_trials = bold_pca_components.reshape(bold_pca_components.shape[0], num_trials, trial_length)
+    coeff_pinv = np.linalg.pinv(pca_model.coeff)
+    beta_pca_full = coeff_pinv @ np.nan_to_num(beta_clean)
+
+    return {"pca_model": pca_model, "bold_pca_trials": bold_pca_trials, "coeff_pinv": coeff_pinv, "beta_pca_full": beta_pca_full, 
+            "bold_clean": bold_clean, "beta_clean": beta_clean, "behavior_matrix": behavioral_matrix, "nan_mask_flat": nan_mask_flat, 
+            "active_coords": active_coords, "active_flat_indices": active_flat_indices}
+
+def prepare_data_func(projection_data, trial_indices, trial_length, run_boundary):
+    trial_indices = np.asarray(trial_indices, dtype=np.int64)
+    effective_num_trials = trial_indices.size
+    behavior_subset = projection_data["behavior_matrix"][trial_indices]
+    beta_pca_full = projection_data["beta_pca_full"]
+    beta_pca = beta_pca_full[:, trial_indices]
+
+    bold_pca_trials = projection_data["bold_pca_trials"][:, trial_indices, :]
+    bold_pca_components = bold_pca_trials.reshape(bold_pca_trials.shape[0], effective_num_trials * trial_length)
+    print(f"bold_pca_components (subset): {bold_pca_components.shape}")
+    print(f"beta_pca (subset): {beta_pca.shape}")
+
+    (C_task, C_bold, C_beta, behavior_vector) = calcu_matrices_func(beta_pca, bold_pca_components, behavior_subset, behave_indice,
+                                                                    trial_len=trial_length, num_trials=effective_num_trials,
+                                                                    trial_indices=trial_indices, run_boundary=run_boundary)
     C_task = standardize_matrix(C_task)
     C_bold = standardize_matrix(C_bold)
     C_beta = standardize_matrix(C_beta)
     print(f"shape: {C_task.shape}, {C_bold.shape}, {C_beta.shape}", flush=True)
     print(f"Range: [{np.min(C_task)}, {np.max(C_task)}], [{np.min(C_bold)}, {np.max(C_bold)}],[{np.min(C_beta)}, {np.max(C_beta)}]", flush=True)
-    
+
     trial_mask = np.isfinite(behavior_vector)
     behavior_observed = behavior_vector[trial_mask]
     behavior_mean = np.mean(behavior_observed)
@@ -288,10 +331,17 @@ def prepare_data_func(bold_clean, beta_clean, behavioral_matrix, nan_mask_flat, 
     beta_observed = beta_pca[:, trial_mask]
     beta_centered = beta_observed - np.mean(beta_observed, axis=1, keepdims=True)
 
-    return {"nan_mask_flat": nan_mask_flat, "active_coords": tuple(np.array(coord) for coord in active_coords), "active_flat_indices": active_flat_indices,
-        "coeff_pinv": coeff_pinv, "beta_centered": beta_centered, "behavior_centered": behavior_centered, 
-        "normalized_behaviors": normalized_behaviors, "behavior_observed": behavior_observed, "beta_observed": beta_observed,
-        "beta_clean": beta_clean, "C_task": C_task, "C_bold": C_bold, "C_beta": C_beta, "active_bold": bold_clean}, pca_model
+    beta_subset = projection_data["beta_clean"][:, trial_indices]
+    bold_subset = projection_data["bold_clean"][:, trial_indices, :]
+
+    return {"nan_mask_flat": projection_data["nan_mask_flat"],
+        "active_coords": tuple(np.array(coord) for coord in projection_data["active_coords"]),
+        "active_flat_indices": projection_data["active_flat_indices"],
+        "coeff_pinv": projection_data["coeff_pinv"], "beta_centered": beta_centered,
+        "behavior_centered": behavior_centered, "normalized_behaviors": normalized_behaviors,
+        "behavior_observed": behavior_observed, "beta_observed": beta_observed,
+        "beta_clean": beta_subset, "C_task": C_task, "C_bold": C_bold, "C_beta": C_beta,
+        "active_bold": bold_subset, "trial_indices": trial_indices, "num_trials": effective_num_trials}
 
 def calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta):
     beta_centered = run_data["beta_centered"]
@@ -390,123 +440,122 @@ def evaluate_projection(data, weights):
 
     return metrics
 
-# def summarize_bootstrap(values, reference=0.0, direction="less"):
-#     values_array = _asarray_filled(values, dtype=np.float64)
-#     finite_mask = np.isfinite(values_array)
-#     values_array = values_array[finite_mask]
+def summarize_bootstrap(values, reference=0.0, direction="less"):
+    values_array = _asarray_filled(values, dtype=np.float64)
+    finite_mask = np.isfinite(values_array)
+    values_array = values_array[finite_mask]
 
-#     summary = {"mean": np.nan, "std": np.nan, "ci_lower": np.nan, "ci_upper": np.nan, "p_value": np.nan, "num_samples": int(values_array.size)}
-#     summary["mean"] = np.mean(values_array)
-#     summary["std"] = np.std(values_array, ddof=1) if values_array.size > 1 else 0.0
-#     summary["ci_lower"], summary["ci_upper"] = (float(x) for x in np.percentile(values_array, [2.5, 97.5]))
+    summary = {"mean": np.nan, "std": np.nan, "ci_lower": np.nan, "ci_upper": np.nan, "p_value": np.nan, "num_samples": int(values_array.size)}
+    summary["mean"] = np.mean(values_array)
+    summary["std"] = np.std(values_array, ddof=1) if values_array.size > 1 else 0.0
+    summary["ci_lower"], summary["ci_upper"] = (float(x) for x in np.percentile(values_array, [2.5, 97.5]))
 
-#     if direction == "greater":
-#         summary["p_value"] = (np.count_nonzero(values_array >= reference) + 1) / (values_array.size + 1)
-#     else:
-#         summary["p_value"] = (np.count_nonzero(values_array <= reference) + 1) / (values_array.size + 1)
-#     return summary
+    if direction == "greater":
+        summary["p_value"] = (np.count_nonzero(values_array >= reference) + 1) / (values_array.size + 1)
+    else:
+        summary["p_value"] = (np.count_nonzero(values_array <= reference) + 1) / (values_array.size + 1)
+    return summary
 
-# def perform_weight_shuffle_tests(train_data, test_data, weights, task_alpha, bold_alpha, beta_alpha, rho_value, num_samples):
-#     weights = weights.ravel()
-#     rng = np.random.default_rng()
-#     penalty_matrices, total_penalty = calcu_penalty_terms(train_data, task_alpha, bold_alpha, beta_alpha)
-#     baseline_penalties = {label: float(weights.T @ matrix @ weights) for label, matrix in penalty_matrices.items()}
-#     baseline_loss = float(weights.T @ total_penalty @ weights)
-#     baseline_train_corr = evaluate_projection(train_data, weights)["pearson"]
-#     baseline_test_corr = evaluate_projection(test_data, weights)["pearson"]
+def perform_weight_shuffle_tests(train_data, test_data, weights, task_alpha, bold_alpha, beta_alpha, rho_value, num_samples):
+    weights = weights.ravel()
+    rng = np.random.default_rng()
+    penalty_matrices, total_penalty = calcu_penalty_terms(train_data, task_alpha, bold_alpha, beta_alpha)
+    baseline_penalties = {label: float(weights.T @ matrix @ weights) for label, matrix in penalty_matrices.items()}
+    baseline_loss = float(weights.T @ total_penalty @ weights)
+    baseline_train_corr = evaluate_projection(train_data, weights)["pearson"]
+    baseline_test_corr = evaluate_projection(test_data, weights)["pearson"]
 
-#     penalty_samples = {label: [] for label in penalty_matrices}
-#     total_loss_samples = []
-#     test_corr_samples = []
-#     train_corr_samples = []
+    penalty_samples = {label: [] for label in penalty_matrices}
+    total_loss_samples = []
+    test_corr_samples = []
+    train_corr_samples = []
 
-#     weights_std = float(np.std(weights))
-#     if not np.isfinite(weights_std) or weights_std < 0:
-#         weights_std = 0.0
-#     noise_std = weights_std * 0.1
-#     if not np.isfinite(noise_std) or noise_std <= 0:
-#         noise_std = 1e-8
+    weights_std = float(np.std(weights))
+    if not np.isfinite(weights_std) or weights_std < 0:
+        weights_std = 0.0
+    noise_std = weights_std * 0.1
+    if not np.isfinite(noise_std) or noise_std <= 0:
+        noise_std = 1e-8
 
-#     print(f"Noise Dist, mean: {np.mean(weights)}, std: {noise_std}")
-#     for iteration in range(num_samples):
-#         noise = rng.normal(loc=np.mean(weights), scale=noise_std, size=weights.shape)
-#         noisy_weights = weights + noise
-#         noisy_weights = np.abs(noisy_weights)
-#         sum_noisy = np.sum(noisy_weights)
-#         if not np.isfinite(sum_noisy) or sum_noisy <= 0:
-#             noisy_weights = np.full_like(noisy_weights, 1.0 / noisy_weights.size)
-#         else:
-#             noisy_weights /= sum_noisy
+    print(f"Noise Dist, mean: {np.mean(weights)}, std: {noise_std}")
+    for iteration in range(num_samples):
+        noise = rng.normal(loc=np.mean(weights), scale=noise_std, size=weights.shape)
+        noisy_weights = weights + noise
+        noisy_weights = np.abs(noisy_weights)
+        sum_noisy = np.sum(noisy_weights)
+        if not np.isfinite(sum_noisy) or sum_noisy <= 0:
+            noisy_weights = np.full_like(noisy_weights, 1.0 / noisy_weights.size)
+        else:
+            noisy_weights /= sum_noisy
 
-#         penalty_values = {}
-#         for label, matrix in penalty_matrices.items():
-#             penalty_value = float(noisy_weights.T @ matrix @ noisy_weights)
-#             penalty_samples[label].append(penalty_value)
-#             penalty_values[label] = penalty_value
+        penalty_values = {}
+        for label, matrix in penalty_matrices.items():
+            penalty_value = float(noisy_weights.T @ matrix @ noisy_weights)
+            penalty_samples[label].append(penalty_value)
+            penalty_values[label] = penalty_value
 
-#         total_loss = float(noisy_weights.T @ total_penalty @ noisy_weights)
-#         total_loss_samples.append(total_loss)
+        total_loss = float(noisy_weights.T @ total_penalty @ noisy_weights)
+        total_loss_samples.append(total_loss)
 
-#         train_metrics = evaluate_projection(train_data, noisy_weights)
-#         test_metrics = evaluate_projection(test_data, noisy_weights)
+        train_metrics = evaluate_projection(train_data, noisy_weights)
+        test_metrics = evaluate_projection(test_data, noisy_weights)
 
-#         train_corr_samples.append(train_metrics["pearson"])
-#         test_corr_samples.append(test_metrics["pearson"])
+        train_corr_samples.append(train_metrics["pearson"])
+        test_corr_samples.append(test_metrics["pearson"])
 
-#     penalty_arrays = {label: np.asarray(values, dtype=np.float64) for label, values in penalty_samples.items()}
-#     total_loss_array = np.asarray(total_loss_samples, dtype=np.float64)
-#     train_corr_array = np.asarray(train_corr_samples, dtype=np.float64)
-#     test_corr_array = np.asarray(test_corr_samples, dtype=np.float64)
+    penalty_arrays = {label: np.asarray(values, dtype=np.float64) for label, values in penalty_samples.items()}
+    total_loss_array = np.asarray(total_loss_samples, dtype=np.float64)
+    train_corr_array = np.asarray(train_corr_samples, dtype=np.float64)
+    test_corr_array = np.asarray(test_corr_samples, dtype=np.float64)
 
-#     penalty_summary = {label: summarize_bootstrap(values, reference=baseline_penalties.get(label, 0.0), direction="less") 
-#                        for label, values in penalty_arrays.items()}
-#     total_loss_summary = summarize_bootstrap(total_loss_array, reference=baseline_loss, direction = "less")
-#     train_direction = "greater" if baseline_train_corr >= 0 else "less"
-#     test_direction = "greater" if baseline_test_corr >= 0 else "less"
-#     correlation_summary = {"train": summarize_bootstrap(train_corr_array, reference=baseline_train_corr, direction=train_direction),
-#                            "test": summarize_bootstrap(test_corr_array, reference=baseline_test_corr, direction=test_direction)}
+    penalty_summary = {label: summarize_bootstrap(values, reference=baseline_penalties.get(label, 0.0), direction="less") 
+                       for label, values in penalty_arrays.items()}
+    total_loss_summary = summarize_bootstrap(total_loss_array, reference=baseline_loss, direction = "less")
+    train_direction = "greater" if baseline_train_corr >= 0 else "less"
+    test_direction = "greater" if baseline_test_corr >= 0 else "less"
+    correlation_summary = {"train": summarize_bootstrap(train_corr_array, reference=baseline_train_corr, direction=train_direction),
+                           "test": summarize_bootstrap(test_corr_array, reference=baseline_test_corr, direction=test_direction)}
 
-#     num_successful = int(np.count_nonzero(np.isfinite(test_corr_array)))
-#     num_failed = int(num_samples - num_successful)
+    num_successful = int(np.count_nonzero(np.isfinite(test_corr_array)))
+    num_failed = int(num_samples - num_successful)
 
-#     return {"penalties": penalty_summary, "total_loss": total_loss_summary, "correlation": correlation_summary, 
-#             "num_requested": num_samples, "num_successful": num_successful, "num_failed": num_failed,
-#             "penalty_samples": penalty_arrays, "total_loss_samples": total_loss_array, "correlation_samples": {"train": train_corr_array, "test": test_corr_array}}
+    return {"penalties": penalty_summary, "total_loss": total_loss_summary, "correlation": correlation_summary, 
+            "num_requested": num_samples, "num_successful": num_successful, "num_failed": num_failed,
+            "penalty_samples": penalty_arrays, "total_loss_samples": total_loss_array, "correlation_samples": {"train": train_corr_array, "test": test_corr_array}}
 
-# def plot_bootstrap_distribution(samples, actual_value, p_value, title, xlabel, output_path):
-#     finite_samples = samples[np.isfinite(samples)]
+def plot_bootstrap_distribution(samples, actual_value, p_value, title, xlabel, output_path):
+    finite_samples = samples[np.isfinite(samples)]
 
-#     num_bins = max(10, min(50, int(np.sqrt(finite_samples.size))))
-#     sample_min = float(np.min(finite_samples))
-#     sample_max = float(np.max(finite_samples))
+    num_bins = max(10, min(50, int(np.sqrt(finite_samples.size))))
+    sample_min = float(np.min(finite_samples))
+    sample_max = float(np.max(finite_samples))
 
-#     lower_edge = float(min(sample_min, actual_value)) if np.isfinite(actual_value) else sample_min
-#     upper_edge = float(max(sample_max, actual_value)) if np.isfinite(actual_value) else sample_max
-#     span_margin = 0.05 * max(sample_max - sample_min, 1e-9)
-#     range_lower = lower_edge - span_margin
-#     range_upper = upper_edge + span_margin
+    lower_edge = float(min(sample_min, actual_value)) if np.isfinite(actual_value) else sample_min
+    upper_edge = float(max(sample_max, actual_value)) if np.isfinite(actual_value) else sample_max
+    span_margin = 0.05 * max(sample_max - sample_min, 1e-9)
+    range_lower = lower_edge - span_margin
+    range_upper = upper_edge + span_margin
 
-#     fig, ax = plt.subplots(figsize=(6, 4))
-#     ax.hist(finite_samples, bins=num_bins, color="#4c72b0", alpha=0.75, edgecolor="black", range=(range_lower, range_upper))
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.hist(finite_samples, bins=num_bins, color="#4c72b0", alpha=0.75, edgecolor="black", range=(range_lower, range_upper))
     
-#     annotation_parts = []
-#     ax.axvline(actual_value, color="#c44e52", linestyle="--", linewidth=2.0, label="Actual")
-#     annotation_parts.append(f"actual={actual_value:.4g}")
-#     annotation_parts.append(f"p={p_value:.4g}")
-#     annotation_text = "\n".join(annotation_parts)
-#     ax.text(0.98, 0.95, annotation_text, transform=ax.transAxes, ha="right", va="top",
-#             fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.85))
+    annotation_parts = []
+    ax.axvline(actual_value, color="#c44e52", linestyle="--", linewidth=2.0, label="Actual")
+    annotation_parts.append(f"actual={actual_value:.4g}")
+    annotation_parts.append(f"p={p_value:.4g}")
+    annotation_text = "\n".join(annotation_parts)
+    ax.text(0.98, 0.95, annotation_text, transform=ax.transAxes, ha="right", va="top",
+            fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.85))
 
-#     ax.set_title(title)
-#     ax.set_xlabel(xlabel)
-#     ax.set_ylabel("Frequency")
-#     ax.set_xlim(range_lower, range_upper)
-#     ax.legend(loc="upper left")
-#     fig.tight_layout()
-#     fig.savefig(output_path, dpi=300)
-#     plt.close(fig)
-#     return output_path
-
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Frequency")
+    ax.set_xlim(range_lower, range_upper)
+    ax.legend(loc="upper left")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+    return output_path
 
 
 def _compute_weighted_active_bold_projection(voxel_weights, data):
@@ -757,6 +806,7 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
     y_projection_voxel = y_projection_voxel_trials.ravel()
     # np.save(f"y_projection_voxel_{file_prefix}.npy", y_projection_voxel)
     return y_projection_voxel
+
 # # %%
 ridge_penalty = 1e-6
 solver_name = "MOSEK"
@@ -776,136 +826,167 @@ bootstrap_iterations = 1000
 trial_downsample_metric = "median"
 metric_label = _describe_trial_metric(trial_downsample_metric).replace(" ", "_")
 
+projection_data = build_projection_dataset(bold_clean, beta_clean, behavior_matrix, nan_mask_flat, active_coords, active_flat_idx, trial_len, num_trials)
 
-def run_cross_run_experiment(alpha_settings, rho_values, bootstrap_samples=0):
-    data, pca_model = prepare_data_func(bold_clean, beta_clean, behavior_matrix, nan_mask_flat, active_coords, active_flat_idx, trial_len, num_trials)
-    bold_pca_components = pca_model.eigvec
+def build_custom_kfold_splits(total_trials, num_folds=5, trials_per_run=None):
+    if trials_per_run is None:
+        trials_per_run = total_trials // 2
+    base_fold = trials_per_run // num_folds
+    remainder = trials_per_run % num_folds
+    fold_sizes = np.full(num_folds, base_fold, dtype=int)
+    if remainder > 0:
+        fold_sizes[:remainder] += 1
 
-    for alpha_setting in alpha_settings:
-        task_alpha = alpha_setting["task_penalty"]
-        bold_alpha = alpha_setting["bold_penalty"]
-        beta_alpha = alpha_setting["beta_penalty"]
-        rho_projection_series = []
-        alpha_prefix = f"sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}"
+    folds = []
+    run_start = 0
+    all_trials = np.arange(total_trials, dtype=np.int64)
+    for fold_idx, block_size in enumerate(fold_sizes, start=1):
+        run1_start = run_start
+        run1_end = run1_start + block_size
+        run2_start = trials_per_run + run1_start
+        run2_end = run2_start + block_size
 
-        for rho_value in rho_values:
-            sweep_suffix = f"task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_rho{rho_value:g}"
-            print(f"optimization with task={task_alpha}, bold={bold_alpha}, beta={beta_alpha}, rho={rho_value}", flush=True)
-            solution = solve_soc_problem(data, task_alpha, bold_alpha, beta_alpha, solver_name, rho_value)
+        test_run1 = np.arange(run1_start, run1_end, dtype=np.int64)
+        test_run2 = np.arange(run2_start, run2_end, dtype=np.int64)
+        test_indices = np.concatenate((test_run1, test_run2))
 
-            component_weights = np.abs(solution["weights"])
-            coeff_pinv = np.asarray(data["coeff_pinv"])
-            voxel_weights = coeff_pinv.T @ component_weights
-            # print(f"voxel_weights shape: {voxel_weights.shape}, component_weights shape: {component_weights.shape}")
-            file_prefix = f"sub{sub}_ses{ses}_{sweep_suffix}"
-            save_active_bold_correlation_map(voxel_weights, data.get("active_coords"), anat_img.shape[:3], anat_img, file_prefix, result_prefix="voxel_weights")
+        train_mask = np.ones(total_trials, dtype=bool)
+        train_mask[test_indices] = False
+        train_indices = all_trials[train_mask]
 
-            # np.save(f"behavior_weights_{file_prefix}.npy", pca_weights)
-            # np.save(f"behavior_weights_pca_{file_prefix}.npy", weights)
+        folds.append({"fold_id": fold_idx, "train_indices": train_indices, "test_indices": test_indices, "test_run1": test_run1, "test_run2": test_run2})
+        run_start = run1_end
+    return folds
 
-            # beta_volume_clean_finite = np.nan_to_num(data["beta_clean"], nan=0.0, posinf=0.0, neginf=0.0)
-            # weighted_voxel_activity = voxel_weights[:, None] * beta_volume_clean_finite
-#             weighted_beta_path = f"beta_weighted_activity_{file_prefix}.npy"
-#             # np.save(weighted_beta_path, weighted_voxel_activity.astype(np.float32))
+def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection_data, bootstrap_samples=0):
+    total_folds = len(fold_splits)
+    bold_pca_components_full = projection_data["pca_model"].eigvec
+    for fold_idx, split in enumerate(fold_splits, start=1):
+        print(f"\n===== Fold {fold_idx}/{total_folds} =====", flush=True)
+        test_indices = split["test_indices"]
+        train_indices = split["train_indices"]
+        run1_desc = (int(split["test_run1"][0] + 1), int(split["test_run1"][-1] + 1))
+        run2_desc = (int(split["test_run2"][0] + 1), int(split["test_run2"][-1] + 1))
+        print(f"Test trials (1-based): run1 {run1_desc[0]}-{run1_desc[1]}, run2 {run2_desc[0]}-{run2_desc[1]}", flush=True)
 
-            projection_signal, voxel_correlations = compute_component_active_bold_correlation(voxel_weights, data) 
-#             # np.save(f"component_active_bold_projection_{file_prefix}.npy", projection_signal)
-            save_active_bold_correlation_map(voxel_correlations, data.get("active_coords"), anat_img.shape[:3], anat_img, file_prefix)
+        train_data = prepare_data_func(projection_data, train_indices, trial_len, trials_per_run)
+        test_data = prepare_data_func(projection_data, test_indices, trial_len, trials_per_run)
+        bold_pca_components = bold_pca_components_full
 
-            beta_projection_signal = None
-            beta_voxel_correlations = None
-            beta_projection_signal, beta_voxel_correlations = compute_component_active_beta_correlation(voxel_weights, data, aggregation=trial_downsample_metric)
-#             # np.save(f"component_active_beta_projection_{metric_label}_{file_prefix}.npy", beta_projection_signal)
-            save_active_bold_correlation_map(beta_voxel_correlations, data.get("active_coords"), anat_img.shape[:3], anat_img, file_prefix, result_prefix=f"active_beta_corr_{metric_label}")
+        for alpha_setting in alpha_settings:
+            task_alpha = alpha_setting["task_penalty"]
+            bold_alpha = alpha_setting["bold_penalty"]
+            beta_alpha = alpha_setting["beta_penalty"]
+            rho_projection_series = []
+            alpha_prefix = f"fold{fold_idx}_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}"
 
-            y_projection_voxel = save_projection_outputs(component_weights, bold_pca_components, trial_len, file_prefix, 
-                                                         task_alpha, bold_alpha, beta_alpha, rho_value,
-                                                         voxel_weights=voxel_weights, beta_clean=beta_clean,
-                                                         data= data, bold_projection=projection_signal)
-            rho_projection_series.append((rho_value, y_projection_voxel))
+            for rho_value in rho_values:
+                sweep_suffix = f"{alpha_prefix}_rho{rho_value:g}"
+                print(f"Fold {fold_idx}: optimization with task={task_alpha}, bold={bold_alpha}, beta={beta_alpha}, rho={rho_value}", flush=True)
+                solution = solve_soc_problem(train_data, task_alpha, bold_alpha, beta_alpha, solver_name, rho_value)
 
-            train_metrics = evaluate_projection(data, component_weights)
-            test_metrics = evaluate_projection(data, component_weights)
+                component_weights = np.abs(solution["weights"])
+                coeff_pinv = np.asarray(train_data["coeff_pinv"])
+                voxel_weights = coeff_pinv.T @ component_weights
+                file_prefix = sweep_suffix
+                save_active_bold_correlation_map(voxel_weights, train_data.get("active_coords"), anat_img.shape[:3], anat_img,
+                                                 file_prefix, result_prefix="voxel_weights")
 
-            print(f"  Solution branch: {solution['branch']}", flush=True)
-            print(f"  Penalty contributions: {solution['penalty_contributions']}", flush=True)
-            print(f"  Total loss (train objective): {solution['total_loss']:.6f}", flush=True)
-            print(f"  Train metrics -> corr: {train_metrics['pearson']:.4f}, R2: {train_metrics['r2']:.4f}", flush=True)
-            print(f"  Test metrics  -> corr: {test_metrics['pearson']:.4f}, R2: {test_metrics['r2']:.4f}", flush=True)
+                projection_signal, voxel_correlations = compute_component_active_bold_correlation(voxel_weights, train_data)
+                save_active_bold_correlation_map(voxel_correlations, train_data.get("active_coords"), anat_img.shape[:3], anat_img, file_prefix)
 
-            if bootstrap_samples > 0:
-                print(f"  Running weight-shuffle analysis with {bootstrap_samples} samples...", flush=True)
-                shuffle_results = perform_weight_shuffle_tests(train_data, test_data, component_weights, task_alpha, bold_alpha, beta_alpha, rho_value, num_samples=bootstrap_samples)
+                beta_projection_signal, beta_voxel_correlations = compute_component_active_beta_correlation(
+                    voxel_weights, train_data, aggregation=trial_downsample_metric)
+                save_active_bold_correlation_map(beta_voxel_correlations, train_data.get("active_coords"), anat_img.shape[:3],
+                                                 anat_img, file_prefix, result_prefix=f"active_beta_corr_{metric_label}")
 
-#                 succeeded = shuffle_results["num_successful"]
-#                 requested = shuffle_results["num_requested"]
-#                 failed = shuffle_results["num_failed"]
-#                 # print(f"    Weight-shuffle successes: {succeeded}/{requested} (failed: {failed})", flush=True)
+                y_projection_voxel = save_projection_outputs(component_weights, bold_pca_components, trial_len, file_prefix,
+                                                             task_alpha, bold_alpha, beta_alpha, rho_value,
+                                                             voxel_weights=voxel_weights, beta_clean=train_data["beta_clean"],
+                                                             data=train_data, bold_projection=projection_signal)
+                rho_projection_series.append((rho_value, y_projection_voxel))
 
-#                 def format_float(value, digits):
-#                     return f"{value:.{digits}f}" if np.isfinite(value) else "nan"
+                train_metrics = evaluate_projection(train_data, component_weights)
+                test_metrics = evaluate_projection(test_data, component_weights)
 
-#                 for label, summary in shuffle_results["penalties"].items():
-#                     mean_str = format_float(summary["mean"], 6)
-#                     ci_lower = format_float(summary["ci_lower"], 6)
-#                     ci_upper = format_float(summary["ci_upper"], 6)
-#                     p_value = format_float(summary["p_value"], 4)
-#                     print(f"    Penalty {label}: mean={mean_str}, 95% CI=[{ci_lower}, {ci_upper}], p={p_value}", flush=True)
+                print(f"  Solution branch: {solution['branch']}", flush=True)
+                print(f"  Penalty contributions: {solution['penalty_contributions']}", flush=True)
+                print(f"  Total loss (train objective): {solution['total_loss']:.6f}", flush=True)
+                print(f"  Train metrics -> corr: {train_metrics['pearson']:.4f}, R2: {train_metrics['r2']:.4f}", flush=True)
+                print(f"  Test metrics  -> corr: {test_metrics['pearson']:.4f}, R2: {test_metrics['r2']:.4f}", flush=True)
 
-#                 total_summary = shuffle_results.get("total_loss", {})
-#                 if total_summary:
-#                     mean_str = format_float(total_summary.get("mean", np.nan), 6)
-#                     ci_lower = format_float(total_summary.get("ci_lower", np.nan), 6)
-#                     ci_upper = format_float(total_summary.get("ci_upper", np.nan), 6)
-#                     p_value = format_float(total_summary.get("p_value", np.nan), 4)
-#                     print(f"    Total loss: mean={mean_str}, 95% CI=[{ci_lower}, {ci_upper}], p={p_value}", flush=True)
+                if bootstrap_samples > 0:
+                    print(f"  Running weight-shuffle analysis with {bootstrap_samples} samples...", flush=True)
+                    shuffle_results = perform_weight_shuffle_tests(train_data, test_data, component_weights, task_alpha, bold_alpha, beta_alpha, rho_value, num_samples=bootstrap_samples)
 
-#                 for split, summary in shuffle_results["correlation"].items():
-#                     mean_str = format_float(summary["mean"], 4)
-#                     ci_lower = format_float(summary["ci_lower"], 4)
-#                     ci_upper = format_float(summary["ci_upper"], 4)
-#                     p_value = format_float(summary["p_value"], 4)
-#                     print(f"    {split.capitalize()} correlation: mean={mean_str}, 95% CI=[{ci_lower}, {ci_upper}], p={p_value}", flush=True)
+                    succeeded = shuffle_results["num_successful"]
+                    requested = shuffle_results["num_requested"]
+                    failed = shuffle_results["num_failed"]
+                    # print(f"    Weight-shuffle successes: {succeeded}/{requested} (failed: {failed})", flush=True)
 
-#                 penalty_samples = shuffle_results.get("penalty_samples", {})
-#                 correlation_samples = shuffle_results.get("correlation_samples", {})
+                    def format_float(value, digits):
+                        return f"{value:.{digits}f}" if np.isfinite(value) else "nan"
 
-#                 for label in ("task", "bold", "beta"):
-#                     samples = penalty_samples.get(label)
-#                     if samples is None or samples.size == 0:
-#                         continue
-#                     actual_value = float(solution["penalty_contributions"].get(label, np.nan))
-#                     summary = shuffle_results["penalties"].get(label, {})
-#                     p_value = summary.get("p_value", np.nan)
+                    for label, summary in shuffle_results["penalties"].items():
+                        mean_str = format_float(summary["mean"], 6)
+                        ci_lower = format_float(summary["ci_lower"], 6)
+                        ci_upper = format_float(summary["ci_upper"], 6)
+                        p_value = format_float(summary["p_value"], 4)
+                        print(f"    Penalty {label}: mean={mean_str}, 95% CI=[{ci_lower}, {ci_upper}], p={p_value}", flush=True)
 
-#                     # penalty_plot_path = f"bootstrap_distribution_{file_prefix}_penalty_{label}.png"
-#                     # created_path = plot_bootstrap_distribution(samples, actual_value, p_value, f"{label.capitalize()} penalty bootstrap", "Penalty value", penalty_plot_path)
+                    total_summary = shuffle_results.get("total_loss", {})
+                    if total_summary:
+                        mean_str = format_float(total_summary.get("mean", np.nan), 6)
+                        ci_lower = format_float(total_summary.get("ci_lower", np.nan), 6)
+                        ci_upper = format_float(total_summary.get("ci_upper", np.nan), 6)
+                        p_value = format_float(total_summary.get("p_value", np.nan), 4)
+                        print(f"    Total loss: mean={mean_str}, 95% CI=[{ci_lower}, {ci_upper}], p={p_value}", flush=True)
 
-#                 correlation_actuals = {"train": float(train_metrics["pearson"]) if np.isfinite(train_metrics["pearson"]) else np.nan,
-#                                        "test": float(test_metrics["pearson"]) if np.isfinite(test_metrics["pearson"]) else np.nan}
+                    for split, summary in shuffle_results["correlation"].items():
+                        mean_str = format_float(summary["mean"], 4)
+                        ci_lower = format_float(summary["ci_lower"], 4)
+                        ci_upper = format_float(summary["ci_upper"], 4)
+                        p_value = format_float(summary["p_value"], 4)
+                        print(f"    {split.capitalize()} correlation: mean={mean_str}, 95% CI=[{ci_lower}, {ci_upper}], p={p_value}", flush=True)
 
-#                 for split, samples in correlation_samples.items():
-#                     actual_value = correlation_actuals.get(split, np.nan)
-#                     summary = shuffle_results["correlation"].get(split, {})
-#                     p_value = summary.get("p_value", np.nan)
-#                     correlation_plot_path = f"bootstrap_distribution_{file_prefix}_{split}_correlation.png"
-#                     created_path = plot_bootstrap_distribution(samples, actual_value, p_value, f"{split.capitalize()} correlation bootstrap", "Correlation coefficient", correlation_plot_path)
-#                     # if created_path:
-#                     #     print(f"    Saved {split} correlation bootstrap plot to {created_path}", flush=True)
+                    penalty_samples = shuffle_results.get("penalty_samples", {})
+                    correlation_samples = shuffle_results.get("correlation_samples", {})
 
-#                 total_samples = shuffle_results.get("total_loss_samples")
-#                 if total_samples is not None and np.size(total_samples) > 0:
-#                     summary = shuffle_results.get("total_loss", {})
-#                     p_value = summary.get("p_value", np.nan)
-#                     total_plot_path = f"bootstrap_distribution_{file_prefix}_total_loss.png"
-#                     created_path = plot_bootstrap_distribution(total_samples, solution["total_loss"], p_value, "Total loss weight shuffle", "Total loss", total_plot_path)
-#                     # if created_path:
-#                         # print(f"    Saved total loss shuffle plot to {created_path}", flush=True)
+                    for label in ("task", "bold", "beta"):
+                        samples = penalty_samples.get(label)
+                        if samples is None or samples.size == 0:
+                            continue
+                        actual_value = float(solution["penalty_contributions"].get(label, np.nan))
+                        summary = shuffle_results["penalties"].get(label, {})
+                        p_value = summary.get("p_value", np.nan)
+
+                        # penalty_plot_path = f"bootstrap_distribution_{file_prefix}_penalty_{label}.png"
+                        # created_path = plot_bootstrap_distribution(samples, actual_value, p_value, f"{label.capitalize()} penalty bootstrap", "Penalty value", penalty_plot_path)
+
+                    correlation_actuals = {"train": float(train_metrics["pearson"]) if np.isfinite(train_metrics["pearson"]) else np.nan,
+                                           "test": float(test_metrics["pearson"]) if np.isfinite(test_metrics["pearson"]) else np.nan}
+
+                    for split, samples in correlation_samples.items():
+                        actual_value = correlation_actuals.get(split, np.nan)
+                        summary = shuffle_results["correlation"].get(split, {})
+                        p_value = summary.get("p_value", np.nan)
+                        correlation_plot_path = f"bootstrap_distribution_{file_prefix}_{split}_correlation.png"
+                        created_path = plot_bootstrap_distribution(samples, actual_value, p_value, f"{split.capitalize()} correlation bootstrap", "Correlation coefficient", correlation_plot_path)
+                        # if created_path:
+                        #     print(f"    Saved {split} correlation bootstrap plot to {created_path}", flush=True)
+
+                    total_samples = shuffle_results.get("total_loss_samples")
+                    if total_samples is not None and np.size(total_samples) > 0:
+                        summary = shuffle_results.get("total_loss", {})
+                        p_value = summary.get("p_value", np.nan)
+                        total_plot_path = f"bootstrap_distribution_{file_prefix}_total_loss.png"
+                        created_path = plot_bootstrap_distribution(total_samples, solution["total_loss"], p_value, "Total loss weight shuffle", "Total loss", total_plot_path)
+                        # if created_path:
+                            # print(f"    Saved total loss shuffle plot to {created_path}", flush=True)
 
         if rho_projection_series:
             aggregate_plot_path = f"y_projection_trials_voxel_{alpha_prefix}_all_rhos.png"
             plot_projection_beta_sweep(rho_projection_series, task_alpha, bold_alpha, beta_alpha, aggregate_plot_path, series_label="Voxel space")
-
 
 if __name__ == "__main__":
 #     parser = argparse.ArgumentParser(description="Run a subset of alpha/rho sweeps.")
@@ -949,6 +1030,7 @@ if __name__ == "__main__":
 #             selected_rhos = [rho_sweep[args.rho_idx]]
 #             print(f"Running rho_idx={args.rho_idx}", flush=True)
 
-    run_cross_run_experiment(selected_alphas, selected_rhos, bootstrap_samples=bootstrap_iterations)
+    fold_splits = build_custom_kfold_splits(num_trials, num_folds=5, trials_per_run=trials_per_run)
+    run_cross_run_experiment(selected_alphas, selected_rhos, fold_splits, projection_data, bootstrap_samples=bootstrap_iterations)
 
 # # %%
