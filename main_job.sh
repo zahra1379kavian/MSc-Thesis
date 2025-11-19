@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=fmri_bigmem
-#SBATCH --array=0-20
+#SBATCH --array=0-26
 #SBATCH --account=st-mmckeown-1
 #SBATCH --time=48:00:00
 #SBATCH --nodes=1
@@ -20,5 +20,5 @@ export HOME=/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis
 source /scratch/st-mmckeown-1/zkavian/fmri_models/myenv/bin/activate
 cd /scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/
 
-python main_bootstrap.py --combo-idx "${SLURM_ARRAY_TASK_ID}"
+python main_bootstrap2.py --combo-idx "${SLURM_ARRAY_TASK_ID}"
 # python matrix_diagnostics.py
