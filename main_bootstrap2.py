@@ -2,13 +2,13 @@
 import argparse
 import os
 from collections import defaultdict
-from itertools import product
 from os.path import join
 from empca.empca.empca import empca
 import cvxpy as cp
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import colors, ticker
 import nibabel as nib
 import numpy as np
 from nilearn import plotting
@@ -620,11 +620,23 @@ def save_active_bold_correlation_map(correlations, active_coords, volume_shape, 
     return
 
 def plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, output_path,
-                         max_trials=10, series_label=None, trial_indices=None):
+                         max_trials=10, series_label=None, trial_indices=None, trial_windows=None):
     num_trials_total, trial_length = y_trials.shape
     time_axis = np.arange(trial_length)
     fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
-    trial_windows = [(10, 20), (40, 50)]
+    if trial_windows is None:
+        window_span = 10
+        first_start = 10 if num_trials_total > 20 else max(0, num_trials_total // 4)
+        second_start = num_trials_total // 2
+        def _build_window(start_idx):
+            start_idx = int(max(0, min(start_idx, max(num_trials_total - 1, 0))))
+            end_idx = min(start_idx + window_span, num_trials_total)
+            if end_idx <= start_idx:
+                end_idx = min(num_trials_total, start_idx + max(1, window_span))
+            return start_idx, end_idx
+        first_window = _build_window(first_start)
+        second_window = _build_window(max(second_start, first_window[1]))
+        trial_windows = [first_window, second_window]
     trial_indices_array = None
     if trial_indices is not None:
         trial_indices_array = np.asarray(trial_indices, dtype=np.int64).ravel()
@@ -732,19 +744,56 @@ def plot_projection_beta_sweep(rho_projection_series, task_alpha, bold_alpha, be
     plt.close(fig)
     return output_path
 
+
+def _load_projection_series(series_path):
+    if not os.path.exists(series_path):
+        return {}
+    try:
+        loaded = np.load(series_path, allow_pickle=True)
+        if isinstance(loaded, np.ndarray):
+            data = loaded.item()
+        else:
+            data = dict(loaded)
+    except Exception as exc:
+        print(f"Warning: failed to load stored rho projections from {series_path}: {exc}", flush=True)
+        return {}
+    series = {}
+    for key, values in data.items():
+        try:
+            rho_key = float(key)
+        except (TypeError, ValueError):
+            continue
+        series[rho_key] = np.asarray(values, dtype=np.float64).ravel()
+    return series
+
+
+def _merge_projection_series(existing_series, new_series):
+    merged = dict(existing_series)
+    for rho_value, projection in new_series:
+        if projection is None:
+            continue
+        merged[float(rho_value)] = np.asarray(projection, dtype=np.float64).ravel()
+    return merged
+
+
+def _save_projection_series(series_path, series_dict):
+    try:
+        np.save(series_path, series_dict, allow_pickle=True)
+    except TypeError:
+        # np.save on some numpy versions does not accept allow_pickle keyword
+        np.save(series_path, series_dict)
+
+
+def _series_dict_to_list(series_dict):
+    return sorted(series_dict.items(), key=lambda item: item[0])
+
 def plot_fold_metric_box(fold_values, title, ylabel, output_path, highlight_threshold=None):
-    if not fold_values:
-        return None
     sorted_values = sorted(fold_values, key=lambda item: item[0])
     fold_ids = np.array([int(idx) for idx, _ in sorted_values], dtype=np.int64)
     raw_values = np.array([float(val) if np.isfinite(val) else np.nan for _, val in sorted_values], dtype=np.float64)
     finite_mask = np.isfinite(raw_values)
     finite_values = raw_values[finite_mask]
     finite_ids = fold_ids[finite_mask]
-
-    if finite_values.size == 0:
-        print(f"Skipping box plot '{title}' because all fold metrics are NaN.", flush=True)
-        return None
 
     fig, ax = plt.subplots(figsize=(6.5, 4.5))
     box = ax.boxplot([finite_values], vert=True, patch_artist=True, widths=0.3,
@@ -753,7 +802,7 @@ def plot_fold_metric_box(fold_values, title, ylabel, output_path, highlight_thre
                      whiskerprops={"color": "#4c72b0"}, capprops={"color": "#4c72b0"},
                      flierprops={"marker": "o", "markerfacecolor": "#c44e52", "markeredgecolor": "#c44e52", "markersize": 5})
 
-    # Overlay individual fold values for transparency on the distribution.
+
     x_center = 1.0
     if finite_values.size > 1:
         jitter = np.linspace(-0.07, 0.07, finite_values.size)
@@ -769,7 +818,15 @@ def plot_fold_metric_box(fold_values, title, ylabel, output_path, highlight_thre
     ax.set_xticklabels([f"{finite_values.size} folds"])
     ax.set_ylabel(ylabel)
     ax.set_title(title)
+    use_scalar_formatter = True
+    if finite_values.size:
+        max_abs = np.nanmax(np.abs(finite_values))
+        if np.isfinite(max_abs) and max_abs < 0.1:
+            ax.yaxis.set_major_formatter(ticker.FormatStrFormatter("%.4f"))
+            use_scalar_formatter = False
 
+    if use_scalar_formatter:
+        ax.ticklabel_format(axis="y", style="plain", useOffset=False)
     if highlight_threshold is not None:
         ax.axhline(highlight_threshold, color="#c44e52", linestyle="--", linewidth=1.0,
                    label=f"threshold={highlight_threshold:g}")
@@ -785,6 +842,79 @@ def plot_fold_metric_box(fold_values, title, ylabel, output_path, highlight_thre
     plt.close(fig)
     return output_path
 
+def plot_metric_heatmap(combo_labels, metric_labels, metric_values, output_path, cmap="viridis"):
+    if not combo_labels:
+        print("Heatmap skipped: no alpha/rho combinations available.", flush=True)
+        return None
+    metric_array = np.asarray(metric_values, dtype=np.float64)
+    if metric_array.size == 0:
+        print("Heatmap skipped: metric matrix is empty.", flush=True)
+        return None
+    if metric_array.shape[0] != len(metric_labels):
+        raise ValueError("metric_labels length must match metric_values rows.")
+    if metric_array.shape[1] != len(combo_labels):
+        raise ValueError("combo_labels length must match metric_values columns.")
+
+    normalized = np.full_like(metric_array, np.nan)
+    for row_idx in range(metric_array.shape[0]):
+        row = metric_array[row_idx]
+        finite_mask = np.isfinite(row)
+        if not np.any(finite_mask):
+            continue
+        row_min = np.nanmin(row)
+        row_max = np.nanmax(row)
+        if not np.isfinite(row_min) or not np.isfinite(row_max):
+            continue
+        if np.isclose(row_min, row_max):
+            normalized[row_idx, finite_mask] = 0.5
+        else:
+            normalized[row_idx, finite_mask] = (row[finite_mask] - row_min) / (row_max - row_min)
+
+    masked_norm = np.ma.masked_invalid(normalized)
+    fig_width = max(9.0, min(0.6 * len(combo_labels), 24.0))
+    fig_height = max(3.5, 0.6 * len(metric_labels))
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    norm = colors.Normalize(vmin=0.0, vmax=1.0)
+    im = ax.imshow(masked_norm, aspect="auto", cmap=cmap, norm=norm)
+    ax.set_xticks(np.arange(len(combo_labels)))
+    ax.set_xticklabels(combo_labels, rotation=0, ha="center", fontsize=9)
+    ax.set_yticks(np.arange(len(metric_labels)))
+    ax.set_yticklabels(metric_labels)
+    ax.set_xlabel("Alpha / rho combinations")
+    ax.set_ylabel("Metric")
+    ax.set_title("Cross-fold averages per hyperparameter set")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.04)
+    cbar.set_label("Row-normalized value")
+
+    def _format_display(label, value):
+        if not np.isfinite(value):
+            return "–"
+        label_lower = label.lower()
+        if "loss" in label_lower:
+            if abs(value) >= 1e3 or abs(value) < 1e-2:
+                return f"{value:.2e}"
+            return f"{value:.3f}"
+        if "p-value" in label_lower or label_lower.endswith("(p)"):
+            return f"{value:.3f}"
+        return f"{value:.3f}"
+
+    for row_idx in range(metric_array.shape[0]):
+        for col_idx in range(metric_array.shape[1]):
+            value = metric_array[row_idx, col_idx]
+            display_text = _format_display(metric_labels[row_idx], value)
+            norm_val = normalized[row_idx, col_idx]
+            if np.isfinite(norm_val):
+                text_color = "#ffffff" if norm_val > 0.6 else "#1a1a1a"
+            else:
+                text_color = "#1a1a1a"
+            ax.text(col_idx, row_idx, display_text, ha="center", va="center",
+                    fontsize=8, color=text_color)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+    return output_path
+
 def _reshape_projection(y_values, trial_length):
     y_values = np.asarray(y_values, dtype=np.float64).ravel()
     num_trials = y_values.size // trial_length
@@ -792,7 +922,7 @@ def _reshape_projection(y_values, trial_length):
 
 def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file_prefix,
                             task_alpha, bold_alpha, beta_alpha, rho_value, voxel_weights, beta_clean,
-                            data=None, bold_projection=None):
+                            data=None, bold_projection=None, plot_trials=True):
 
     # component_weights = pca_weights.ravel()
     # y_projection_pc = component_weights @ bold_pca_components
@@ -807,9 +937,10 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
     trial_indices = None
     if data is not None:
         trial_indices = data.get("trial_indices")
-    plot_path = f"y_projection_trials_{file_prefix}.png"
-    plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, plot_path,
-                         series_label="Active BOLD space", trial_indices=trial_indices)
+    if plot_trials:
+        plot_path = f"y_projection_trials_{file_prefix}.png"
+        plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, rho_value, plot_path,
+                             series_label="Active BOLD space", trial_indices=trial_indices)
 
     voxel_weights = voxel_weights.ravel()
     beta_matrix = np.nan_to_num(beta_clean, nan=0.0, posinf=0.0, neginf=0.0)
@@ -822,18 +953,19 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
 ridge_penalty = 1e-6
 solver_name = "MOSEK"
 
-# task_penalty_sweep = [0.0, 0.5, 100.0]
-# bold_penalty_sweep = [0.0, 0.25, 100.0]
-# beta_penalty_sweep = [0, 50.0, 500.0]
-task_penalty_sweep = [0.5, 0.25, 50]
-bold_penalty_sweep = [0.25, 50, 0.5]
-beta_penalty_sweep = [50, 0.25, 0.5]
+# task_penalty_sweep = [0.5, 0.25]
+# bold_penalty_sweep = [0.25, 0.5]
+# beta_penalty_sweep = [50, 0.25]
+
+penalty_sweep = [(0.5, 0.25, 0.25), (0.5, 0.25, 50), (0.25, 0.5, 0.25), (0.25, 0.5, 50), (50, 50, 0.25), (50, 50, 50)]
+
 alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha}
-    for task_alpha, bold_alpha, beta_alpha in product(task_penalty_sweep, bold_penalty_sweep, beta_penalty_sweep)]
+    for task_alpha, bold_alpha, beta_alpha in penalty_sweep]
 # rho_sweep = [0.2, 0.6, 0.8]
-rho_sweep = [0.6]
+rho_sweep = [0.2, 0.6]
 trial_downsample_metric = "median"
 metric_label = _describe_trial_metric(trial_downsample_metric).replace(" ", "_")
+SAVE_PER_FOLD_VOXEL_MAPS = False  # disable individual fold voxel-weight plots; averages saved later
 
 projection_data = build_projection_dataset(bold_clean, beta_clean, behavior_matrix, nan_mask_flat, active_coords, active_flat_idx, trial_len, num_trials)
 
@@ -846,25 +978,33 @@ def build_custom_kfold_splits(total_trials, num_folds=5, trials_per_run=None):
     if remainder > 0:
         fold_sizes[:remainder] += 1
 
-    folds = []
+    run1_folds = []
+    run2_folds = []
     run_start = 0
-    all_trials = np.arange(total_trials, dtype=np.int64)
-    for fold_idx, block_size in enumerate(fold_sizes, start=1):
+    for block_size in fold_sizes:
         run1_start = run_start
         run1_end = run1_start + block_size
         run2_start = trials_per_run + run1_start
         run2_end = run2_start + block_size
 
-        test_run1 = np.arange(run1_start, run1_end, dtype=np.int64)
-        test_run2 = np.arange(run2_start, run2_end, dtype=np.int64)
-        test_indices = np.concatenate((test_run1, test_run2))
-
-        train_mask = np.ones(total_trials, dtype=bool)
-        train_mask[test_indices] = False
-        train_indices = all_trials[train_mask]
-
-        folds.append({"fold_id": fold_idx, "train_indices": train_indices, "test_indices": test_indices, "test_run1": test_run1, "test_run2": test_run2})
+        run1_folds.append(np.arange(run1_start, run1_end, dtype=np.int64))
+        run2_folds.append(np.arange(run2_start, run2_end, dtype=np.int64))
         run_start = run1_end
+
+    folds = []
+    all_trials = np.arange(total_trials, dtype=np.int64)
+    fold_id = 1
+    for run1_fold_idx, test_run1 in enumerate(run1_folds, start=1):
+        for run2_fold_idx, test_run2 in enumerate(run2_folds, start=1):
+            test_indices = np.concatenate((test_run1, test_run2))
+
+            train_mask = np.ones(total_trials, dtype=bool)
+            train_mask[test_indices] = False
+            train_indices = all_trials[train_mask]
+
+            folds.append({"fold_id": fold_id, "train_indices": train_indices, "test_indices": test_indices, 
+                          "test_run1": test_run1, "test_run2": test_run2, "run1_fold": run1_fold_idx, "run2_fold": run2_fold_idx})
+            fold_id += 1
     return folds
 
 def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection_data):
@@ -902,8 +1042,6 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
         container[field].append(arr)
 
     def _stack_nanmean(values):
-        if not values:
-            return None
         stacked = np.stack(values, axis=0)
         with np.errstate(invalid="ignore"):
             return np.nanmean(stacked, axis=0)
@@ -914,6 +1052,10 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
         train_indices = split["train_indices"]
         run1_desc = (int(split["test_run1"][0] + 1), int(split["test_run1"][-1] + 1))
         run2_desc = (int(split["test_run2"][0] + 1), int(split["test_run2"][-1] + 1))
+        run1_fold = split.get("run1_fold")
+        run2_fold = split.get("run2_fold")
+        if run1_fold is not None and run2_fold is not None:
+            print(f"Fold pairing: run1 fold {run1_fold}, run2 fold {run2_fold}", flush=True)
         print(f"Test trials (1-based): run1 {run1_desc[0]}-{run1_desc[1]}, run2 {run2_desc[0]}-{run2_desc[1]}", flush=True)
 
         train_data = prepare_data_func(projection_data, train_indices, trial_len, trials_per_run)
@@ -924,13 +1066,11 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
             task_alpha = alpha_setting["task_penalty"]
             bold_alpha = alpha_setting["bold_penalty"]
             beta_alpha = alpha_setting["beta_penalty"]
-            rho_projection_series = []
             alpha_prefix = f"fold{fold_idx}_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}"
 
             for rho_value in rho_values:
                 metrics_key = (task_alpha, bold_alpha, beta_alpha, rho_value)
-                combo_label = (f"task={task_alpha:g}, bold={bold_alpha:g}, "
-                               f"beta={beta_alpha:g}, rho={rho_value:g}")
+                combo_label = (f"task={task_alpha:g}, bold={bold_alpha:g}, beta={beta_alpha:g}, rho={rho_value:g}")
                 sweep_suffix = f"{alpha_prefix}_rho{rho_value:g}"
                 print(f"Fold {fold_idx}: optimization with task={task_alpha}, bold={bold_alpha}, beta={beta_alpha}, rho={rho_value}", flush=True)
                 solution = solve_soc_problem(train_data, task_alpha, bold_alpha, beta_alpha, solver_name, rho_value)
@@ -939,27 +1079,24 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
                 coeff_pinv = np.asarray(train_data["coeff_pinv"])
                 voxel_weights = coeff_pinv.T @ component_weights
                 file_prefix = sweep_suffix
-                save_active_bold_correlation_map(voxel_weights *1000, train_data.get("active_coords"), anat_img.shape[:3], anat_img,
-                                                 file_prefix, result_prefix="voxel_weights")
+                if SAVE_PER_FOLD_VOXEL_MAPS:
+                    save_active_bold_correlation_map(voxel_weights * 1000, train_data.get("active_coords"),
+                                                     anat_img.shape[:3], anat_img, file_prefix, result_prefix="voxel_weights")
 
                 projection_signal, voxel_correlations = compute_component_active_bold_correlation(voxel_weights, train_data)
-                save_active_bold_correlation_map(voxel_correlations, train_data.get("active_coords"), anat_img.shape[:3], anat_img, file_prefix)
-
                 beta_projection_signal, beta_voxel_correlations = compute_component_active_beta_correlation(
                     voxel_weights, train_data, aggregation=trial_downsample_metric)
-                save_active_bold_correlation_map(beta_voxel_correlations, train_data.get("active_coords"), anat_img.shape[:3],
-                                                 anat_img, file_prefix, result_prefix=f"active_beta_corr_{metric_label}")
 
                 y_projection_voxel = save_projection_outputs(component_weights, bold_pca_components, trial_len, file_prefix,
                                                              task_alpha, bold_alpha, beta_alpha, rho_value,
                                                              voxel_weights=voxel_weights, beta_clean=train_data["beta_clean"],
-                                                             data=train_data, bold_projection=projection_signal)
-                rho_projection_series.append((rho_value, y_projection_voxel))
+                                                             data=train_data, bold_projection=projection_signal,
+                                                             plot_trials=False)  # only plot fold-averaged projections later
                 fold_outputs = fold_output_tracker[metrics_key]
                 _append_fold_array(fold_outputs, "voxel_weights", np.abs(voxel_weights), combo_label)
                 _append_fold_array(fold_outputs, "bold_corr", voxel_correlations, combo_label)
                 _append_fold_array(fold_outputs, "beta_corr", beta_voxel_correlations, combo_label)
-                _append_fold_array(fold_outputs, "projection", y_projection_voxel, combo_label)
+                _append_fold_array(fold_outputs, "projection", projection_signal, combo_label)
 
                 train_metrics = evaluate_projection(train_data, component_weights)
                 test_metrics = evaluate_projection(test_data, component_weights)
@@ -993,19 +1130,12 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
                 fold_metrics["test_p"].append((fold_idx, float(test_metrics["pearson_p"])))
                 fold_metrics["total_loss"].append((fold_idx, float(solution["total_loss"])))
 
-        if rho_projection_series:
-            aggregate_plot_path = f"y_projection_trials_voxel_{alpha_prefix}_all_rhos.png"
-            plot_projection_beta_sweep(rho_projection_series, task_alpha, bold_alpha, beta_alpha, aggregate_plot_path,
-                                       series_label="Voxel space", trial_indices=train_data.get("trial_indices"))
-
     if fold_metric_records:
         print("\n===== Saving fold-wise metric bar plots =====", flush=True)
         for metrics_key in sorted(fold_metric_records.keys()):
             task_alpha, bold_alpha, beta_alpha, rho_value = metrics_key
-            combo_label = (f"task={task_alpha:g}, bold={bold_alpha:g}, "
-                           f"beta={beta_alpha:g}, rho={rho_value:g}")
-            metrics_prefix = (f"foldmetrics_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_"
-                              f"beta{beta_alpha:g}_rho{rho_value:g}")
+            combo_label = (f"task={task_alpha:g}, bold={bold_alpha:g}, beta={beta_alpha:g}, rho={rho_value:g}")
+            metrics_prefix = (f"foldmetrics_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_rho{rho_value:g}")
             metric_records = fold_metric_records[metrics_key]
             for metric_name, entries in metric_records.items():
                 config = metric_plot_configs.get(metric_name)
@@ -1061,35 +1191,53 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
                 if not rho_series:
                     continue
                 avg_base_prefix = f"foldavg_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}"
+                avg_series_storage = f"rho_series_voxel_{avg_base_prefix}.npy"
+                existing_avg = _load_projection_series(avg_series_storage)
+                merged_avg = _merge_projection_series(existing_avg, rho_series)
+                _save_projection_series(avg_series_storage, merged_avg)
                 aggregate_plot_path = f"y_projection_trials_voxel_{avg_base_prefix}_all_rhos.png"
-                plot_projection_beta_sweep(rho_series, task_alpha, bold_alpha, beta_alpha, aggregate_plot_path,
-                                           series_label="Voxel space (fold avg)")
+                plot_projection_beta_sweep(_series_dict_to_list(merged_avg), task_alpha, bold_alpha, beta_alpha,
+                                           aggregate_plot_path, series_label="Voxel space (fold avg)")
 
     if aggregate_metrics:
         print("\n===== Cross-fold average metrics =====", flush=True)
         def _safe_mean(values):
             return float(np.mean(values)) if values else np.nan
 
+        heatmap_metric_defs = [("train_corr", "Train corr"), ("test_corr", "Test corr"), ("train_p", "Train p-value"),
+                               ("test_p", "Test p-value"), ("total_loss", "Total loss")]
+        heatmap_storage = {key: [] for key, _ in heatmap_metric_defs}
+        heatmap_combo_labels = []
+
         for metrics_key in sorted(aggregate_metrics.keys()):
             task_alpha, bold_alpha, beta_alpha, rho_value = metrics_key
             bucket = aggregate_metrics[metrics_key]
             train_corr_mean = _safe_mean(bucket["train_corr"])
-            # train_r2_mean = _safe_mean(bucket["train_r2"])
-            # train_mse_mean = _safe_mean(bucket["train_mse"])
             train_p_mean = _safe_mean(bucket["train_p"])
             test_corr_mean = _safe_mean(bucket["test_corr"])
-            # test_r2_mean = _safe_mean(bucket["test_r2"])
-            # test_mse_mean = _safe_mean(bucket["test_mse"])
             test_p_mean = _safe_mean(bucket["test_p"])
             total_loss_mean = _safe_mean(bucket["total_loss"])
             fold_count = len(bucket["test_corr"])
+            combo_label = (f"task={task_alpha:g}\n bold={bold_alpha:g}\n beta={beta_alpha:g}\n rho={rho_value:g}")
+            heatmap_combo_labels.append(combo_label)
+            metric_summary = {"train_corr": train_corr_mean, "test_corr": test_corr_mean, "train_p": train_p_mean, "test_p": test_p_mean, "total_loss": total_loss_mean}
+            for metric_key, _ in heatmap_metric_defs:
+                heatmap_storage[metric_key].append(metric_summary.get(metric_key, np.nan))
+
             print(f"task={task_alpha:g}, bold={bold_alpha:g}, beta={beta_alpha:g}, rho={rho_value:g} "
                 f"(folds contributing={fold_count}): "
                 f"train corr={train_corr_mean:.4f} (p={train_p_mean:.4f}), "
                 f"test corr={test_corr_mean:.4f} (p={test_p_mean:.4f}), "
-                # f"train R2={train_r2_mean:.4f}, test R2={test_r2_mean:.4f}, "
-                # f"train MSE={train_mse_mean:.4f}, test MSE={test_mse_mean:.4f}, "
                 f"avg loss={total_loss_mean:.4f}", flush=True)
+
+        if heatmap_combo_labels:
+            heatmap_values = [heatmap_storage[key] for key, _ in heatmap_metric_defs]
+            metric_labels = [label for _, label in heatmap_metric_defs]
+            heatmap_path = f"crossfold_metric_heatmap_sub{sub}_ses{ses}.png"
+            created_heatmap = plot_metric_heatmap(heatmap_combo_labels, metric_labels,
+                                                  heatmap_values, heatmap_path, cmap="magma")
+            if created_heatmap:
+                print(f"Saved aggregated metric heatmap -> {created_heatmap}", flush=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run a subset of alpha/rho sweeps.")
@@ -1099,6 +1247,8 @@ if __name__ == "__main__":
                         help="0-based index into rho_sweep; omit to iterate over all rhos.")
     parser.add_argument("--combo-idx", type=int, default=None,
                         help="Single 0-based index over alpha×rho combinations (overrides --alpha-idx/--rho-idx).")
+    parser.add_argument("--num-folds", type=int, default=5,
+                        help="Number of cross-validation folds to build per run.")
     args = parser.parse_args()
 
     combo_idx = args.combo_idx
@@ -1133,7 +1283,13 @@ if __name__ == "__main__":
             selected_rhos = [rho_sweep[args.rho_idx]]
             print(f"Running rho_idx={args.rho_idx}", flush=True)
 
-    fold_splits = build_custom_kfold_splits(num_trials, num_folds=5, trials_per_run=trials_per_run)
+    if args.num_folds < 1:
+        raise ValueError("num_folds must be >= 1")
+    if args.num_folds > trials_per_run:
+        raise ValueError("num_folds cannot exceed trials_per_run.")
+
+    fold_splits = build_custom_kfold_splits(num_trials, num_folds=args.num_folds, trials_per_run=trials_per_run)
+    print(f"Constructed {len(fold_splits)} fold pairs using num_folds={args.num_folds} per run.", flush=True)
     run_cross_run_experiment(selected_alphas, selected_rhos, fold_splits, projection_data)
 
 # # %%
