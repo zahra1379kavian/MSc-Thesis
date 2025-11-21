@@ -957,7 +957,8 @@ solver_name = "MOSEK"
 # bold_penalty_sweep = [0.25, 0.5]
 # beta_penalty_sweep = [50, 0.25]
 
-penalty_sweep = [(0.5, 0.25, 0.25), (0.5, 0.25, 50), (0.25, 0.5, 0.25), (0.25, 0.5, 50), (50, 50, 0.25), (50, 50, 50)]
+# penalty_sweep = [(0.5, 0.25, 0.25), (0.5, 0.25, 50), (0.25, 0.5, 0.25), (0.25, 0.5, 50), (50, 50, 0.25), (50, 50, 50)]
+penalty_sweep = [(0.5, 0.25, 0.25)]
 
 alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha}
     for task_alpha, bold_alpha, beta_alpha in penalty_sweep]
@@ -997,11 +998,9 @@ def build_custom_kfold_splits(total_trials, num_folds=5, trials_per_run=None):
     for run1_fold_idx, test_run1 in enumerate(run1_folds, start=1):
         for run2_fold_idx, test_run2 in enumerate(run2_folds, start=1):
             test_indices = np.concatenate((test_run1, test_run2))
-
             train_mask = np.ones(total_trials, dtype=bool)
             train_mask[test_indices] = False
             train_indices = all_trials[train_mask]
-
             folds.append({"fold_id": fold_id, "train_indices": train_indices, "test_indices": test_indices, 
                           "test_run1": test_run1, "test_run2": test_run2, "run1_fold": run1_fold_idx, "run2_fold": run2_fold_idx})
             fold_id += 1
@@ -1010,36 +1009,14 @@ def build_custom_kfold_splits(total_trials, num_folds=5, trials_per_run=None):
 def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection_data):
     total_folds = len(fold_splits)
     bold_pca_components_full = projection_data["pca_model"].eigvec
-    # aggregate_metrics = defaultdict(lambda: {"train_corr": [], "train_r2": [], "train_mse": [], "train_p": [], "test_corr": [], "test_r2": [], "test_mse": [], "test_p": [], "total_loss": []})
     aggregate_metrics = defaultdict(lambda: {"train_corr": [], "train_p": [], "test_corr": [], "test_p": [], "total_loss": []})
     fold_metric_records = defaultdict(lambda: defaultdict(list))
-    fold_output_tracker = defaultdict(lambda: {"voxel_weights": [], "voxel_weights_shape": None, "bold_corr": [], "bold_corr_shape": None, "beta_corr": [], "beta_corr_shape": None, "projection": [], "projection_shape": None})
-    metric_plot_configs = {
-        "train_corr": {"title": "Train correlation", "ylabel": "Corr"},
-        "test_corr": {"title": "Test correlation", "ylabel": "Corr"},
-        # "train_r2": {"title": "Train R^2", "ylabel": "R^2"},
-        # "test_r2": {"title": "Test R^2", "ylabel": "R^2"},
-        # "train_mse": {"title": "Train MSE", "ylabel": "MSE"},
-        # "test_mse": {"title": "Test MSE", "ylabel": "MSE"},
-        "train_p": {"title": "Train correlation p-value", "ylabel": "p-value", "threshold": 0.05},
-        "test_p": {"title": "Test correlation p-value", "ylabel": "p-value", "threshold": 0.05},
-        "total_loss": {"title": "Total loss", "ylabel": "Objective value"}}
-
-    def _append_if_finite(target_list, value):
-        if np.isfinite(value):
-            target_list.append(float(value))
-
-    def _append_fold_array(container, field, values, combo_label):
-        arr = np.asarray(values, dtype=np.float64).ravel()
-        shape_key = f"{field}_shape"
-        existing_shape = container.get(shape_key)
-        if existing_shape is None:
-            container[shape_key] = arr.shape
-        elif existing_shape != arr.shape:
-            print(f"Skipping accumulation of {field} for {combo_label} due to shape mismatch "
-                  f"{arr.shape} vs {existing_shape}", flush=True)
-            return
-        container[field].append(arr)
+    fold_output_tracker = defaultdict(lambda: {"voxel_weights": [], "bold_corr": [], "beta_corr": [], "projection": []})
+    metric_plot_configs = {"train_corr": {"title": "Train correlation", "ylabel": "Corr"},
+                           "test_corr": {"title": "Test correlation", "ylabel": "Corr"},
+                           "train_p": {"title": "Train correlation p-value", "ylabel": "p-value", "threshold": 0.05},
+                           "test_p": {"title": "Test correlation p-value", "ylabel": "p-value", "threshold": 0.05},
+                           "total_loss": {"title": "Total loss", "ylabel": "Objective value"}}
 
     def _stack_nanmean(values):
         stacked = np.stack(values, axis=0)
@@ -1084,8 +1061,7 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
                                                      anat_img.shape[:3], anat_img, file_prefix, result_prefix="voxel_weights")
 
                 projection_signal, voxel_correlations = compute_component_active_bold_correlation(voxel_weights, train_data)
-                beta_projection_signal, beta_voxel_correlations = compute_component_active_beta_correlation(
-                    voxel_weights, train_data, aggregation=trial_downsample_metric)
+                beta_projection_signal, beta_voxel_correlations = compute_component_active_beta_correlation(voxel_weights, train_data, aggregation=trial_downsample_metric)
 
                 y_projection_voxel = save_projection_outputs(component_weights, bold_pca_components, trial_len, file_prefix,
                                                              task_alpha, bold_alpha, beta_alpha, rho_value,
@@ -1093,10 +1069,10 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
                                                              data=train_data, bold_projection=projection_signal,
                                                              plot_trials=False)  # only plot fold-averaged projections later
                 fold_outputs = fold_output_tracker[metrics_key]
-                _append_fold_array(fold_outputs, "voxel_weights", np.abs(voxel_weights), combo_label)
-                _append_fold_array(fold_outputs, "bold_corr", voxel_correlations, combo_label)
-                _append_fold_array(fold_outputs, "beta_corr", beta_voxel_correlations, combo_label)
-                _append_fold_array(fold_outputs, "projection", projection_signal, combo_label)
+                fold_outputs["voxel_weights"].append(np.abs(voxel_weights))
+                fold_outputs["bold_corr"].append(voxel_correlations)
+                fold_outputs["beta_corr"].append(beta_voxel_correlations)
+                fold_outputs["projection"].append(projection_signal)
 
                 train_metrics = evaluate_projection(train_data, component_weights)
                 test_metrics = evaluate_projection(test_data, component_weights)
@@ -1109,15 +1085,10 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
 
                 metrics_key = (task_alpha, bold_alpha, beta_alpha, rho_value)
                 bucket = aggregate_metrics[metrics_key]
-                _append_if_finite(bucket["train_corr"], train_metrics["pearson"])
-                # _append_if_finite(bucket["train_r2"], train_metrics["r2"])
-                # _append_if_finite(bucket["train_mse"], train_metrics["mse"])
-                _append_if_finite(bucket["train_p"], train_metrics["pearson_p"])
-                _append_if_finite(bucket["test_corr"], test_metrics["pearson"])
-                # _append_if_finite(bucket["test_r2"], test_metrics["r2"])
-                # _append_if_finite(bucket["test_mse"], test_metrics["mse"])
-                _append_if_finite(bucket["test_p"], test_metrics["pearson_p"])
-                _append_if_finite(bucket["total_loss"], solution["total_loss"])
+                bucket["train_corr"].append(train_metrics["pearson"])
+                bucket["train_p"].append(train_metrics["pearson_p"])
+                bucket["test_p"].append(train_metrics["pearson_p"])
+                bucket["total_loss"].append(train_metrics["total_loss"])
 
                 fold_metrics = fold_metric_records[metrics_key]
                 fold_metrics["train_corr"].append((fold_idx, float(train_metrics["pearson"])))
@@ -1159,45 +1130,31 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
             task_alpha, bold_alpha, beta_alpha, rho_value = metrics_key
             fold_outputs = fold_output_tracker[metrics_key]
             avg_prefix = f"foldavg_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_rho{rho_value:g}"
-            weights_avg = _stack_nanmean(fold_outputs["voxel_weights"])
-            if weights_avg is not None:
-                save_active_bold_correlation_map(weights_avg * 1000, active_coords, volume_shape, anat_img, avg_prefix,
-                                                 result_prefix="voxel_weights")
-            bold_corr_avg = _stack_nanmean(fold_outputs["bold_corr"])
-            if bold_corr_avg is not None:
-                save_active_bold_correlation_map(bold_corr_avg, active_coords, volume_shape, anat_img, avg_prefix)
-            beta_corr_avg = _stack_nanmean(fold_outputs["beta_corr"])
-            if beta_corr_avg is not None:
-                save_active_bold_correlation_map(beta_corr_avg, active_coords, volume_shape, anat_img, avg_prefix,
-                                                 result_prefix=f"active_beta_corr_{metric_label}")
-            projection_avg = _stack_nanmean(fold_outputs["projection"])
-            if projection_avg is not None:
-                total_points = projection_avg.size
-                if total_points % trial_len == 0:
-                    _, avg_trials = _reshape_projection(projection_avg, trial_len)
-                    avg_plot_path = f"y_projection_trials_{avg_prefix}.png"
-                    plot_projection_bold(avg_trials, task_alpha, bold_alpha, beta_alpha, rho_value, avg_plot_path,
-                                         series_label="Voxel space (fold avg)")
-                    avg_series_key = (task_alpha, bold_alpha, beta_alpha)
-                    fold_avg_projection_series[avg_series_key].append((rho_value, projection_avg))
-                else:
-                    print(f"Skipping projection averaging for task={task_alpha:g}, bold={bold_alpha:g}, "
-                          f"beta={beta_alpha:g}, rho={rho_value:g} due to incompatible length {total_points}", flush=True)
+
+            weights_avg = np.nanmean(np.stack(fold_outputs["voxel_weights"], axis=0), axis=0)
+            save_active_bold_correlation_map(weights_avg * 1000, active_coords, volume_shape, anat_img, avg_prefix, result_prefix="voxel_weights")
+            bold_corr_avg = np.nanmean(np.stack(fold_outputs["bold_corr"], axis=0), axis=0)
+            save_active_bold_correlation_map(bold_corr_avg, active_coords, volume_shape, anat_img, avg_prefix)
+            beta_corr_avg = np.nanmean(np.stack(fold_outputs["beta_corr"], axis=0), axis=0)
+            save_active_bold_correlation_map(beta_corr_avg, active_coords, volume_shape, anat_img, avg_prefix, result_prefix=f"active_beta_corr_{metric_label}")
+            projection_avg = np.nanmean(np.stack(fold_outputs["projection"], axis=0), axis=0)
+            _, avg_trials = _reshape_projection(projection_avg, trial_len)
+            avg_plot_path = f"y_projection_trials_{avg_prefix}.png"
+            plot_projection_bold(avg_trials, task_alpha, bold_alpha, beta_alpha, rho_value, avg_plot_path, series_label="Voxel space (fold avg)")
+            avg_series_key = (task_alpha, bold_alpha, beta_alpha)
+            fold_avg_projection_series[avg_series_key].append((rho_value, projection_avg))
 
         if fold_avg_projection_series:
             for avg_series_key in sorted(fold_avg_projection_series.keys()):
                 task_alpha, bold_alpha, beta_alpha = avg_series_key
                 rho_series = fold_avg_projection_series[avg_series_key]
-                if not rho_series:
-                    continue
                 avg_base_prefix = f"foldavg_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}"
                 avg_series_storage = f"rho_series_voxel_{avg_base_prefix}.npy"
                 existing_avg = _load_projection_series(avg_series_storage)
                 merged_avg = _merge_projection_series(existing_avg, rho_series)
                 _save_projection_series(avg_series_storage, merged_avg)
                 aggregate_plot_path = f"y_projection_trials_voxel_{avg_base_prefix}_all_rhos.png"
-                plot_projection_beta_sweep(_series_dict_to_list(merged_avg), task_alpha, bold_alpha, beta_alpha,
-                                           aggregate_plot_path, series_label="Voxel space (fold avg)")
+                plot_projection_beta_sweep(_series_dict_to_list(merged_avg), task_alpha, bold_alpha, beta_alpha, aggregate_plot_path, series_label="Voxel space (fold avg)")
 
     if aggregate_metrics:
         print("\n===== Cross-fold average metrics =====", flush=True)
