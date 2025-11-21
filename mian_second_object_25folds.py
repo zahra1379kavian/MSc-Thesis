@@ -599,7 +599,7 @@ def save_active_bold_correlation_map(correlations, active_coords, volume_shape, 
 
     corr_img = nib.Nifti1Image(volume, anat_img.affine, anat_img.header)
     volume_path = f"{result_prefix}_{file_prefix}.nii.gz"
-    # nib.save(corr_img, volume_path)
+    nib.save(corr_img, volume_path)
 
     if np.any(np.isfinite(display_values)):
         display_volume = np.nan_to_num(volume, nan=0.0, posinf=0.0, neginf=0.0)
