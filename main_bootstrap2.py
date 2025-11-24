@@ -913,78 +913,78 @@ def plot_train_test_total_loss_box(train_values, test_values, title, ylabel, out
     plt.close(fig)
     return output_path
 
-def plot_metric_heatmap(combo_labels, metric_labels, metric_values, output_path, cmap="viridis"):
-    if not combo_labels:
-        print("Heatmap skipped: no alpha/rho combinations available.", flush=True)
-        return None
-    metric_array = np.asarray(metric_values, dtype=np.float64)
-    if metric_array.size == 0:
-        print("Heatmap skipped: metric matrix is empty.", flush=True)
-        return None
-    if metric_array.shape[0] != len(metric_labels):
-        raise ValueError("metric_labels length must match metric_values rows.")
-    if metric_array.shape[1] != len(combo_labels):
-        raise ValueError("combo_labels length must match metric_values columns.")
+# def plot_metric_heatmap(combo_labels, metric_labels, metric_values, output_path, cmap="viridis"):
+#     if not combo_labels:
+#         print("Heatmap skipped: no alpha/rho combinations available.", flush=True)
+#         return None
+#     metric_array = np.asarray(metric_values, dtype=np.float64)
+#     if metric_array.size == 0:
+#         print("Heatmap skipped: metric matrix is empty.", flush=True)
+#         return None
+#     if metric_array.shape[0] != len(metric_labels):
+#         raise ValueError("metric_labels length must match metric_values rows.")
+#     if metric_array.shape[1] != len(combo_labels):
+#         raise ValueError("combo_labels length must match metric_values columns.")
 
-    normalized = np.full_like(metric_array, np.nan)
-    for row_idx in range(metric_array.shape[0]):
-        row = metric_array[row_idx]
-        finite_mask = np.isfinite(row)
-        if not np.any(finite_mask):
-            continue
-        row_min = np.nanmin(row)
-        row_max = np.nanmax(row)
-        if not np.isfinite(row_min) or not np.isfinite(row_max):
-            continue
-        if np.isclose(row_min, row_max):
-            normalized[row_idx, finite_mask] = 0.5
-        else:
-            normalized[row_idx, finite_mask] = (row[finite_mask] - row_min) / (row_max - row_min)
+#     normalized = np.full_like(metric_array, np.nan)
+#     for row_idx in range(metric_array.shape[0]):
+#         row = metric_array[row_idx]
+#         finite_mask = np.isfinite(row)
+#         if not np.any(finite_mask):
+#             continue
+#         row_min = np.nanmin(row)
+#         row_max = np.nanmax(row)
+#         if not np.isfinite(row_min) or not np.isfinite(row_max):
+#             continue
+#         if np.isclose(row_min, row_max):
+#             normalized[row_idx, finite_mask] = 0.5
+#         else:
+#             normalized[row_idx, finite_mask] = (row[finite_mask] - row_min) / (row_max - row_min)
 
-    masked_norm = np.ma.masked_invalid(normalized)
-    fig_width = max(9.0, min(0.6 * len(combo_labels), 24.0))
-    fig_height = max(3.5, 0.6 * len(metric_labels))
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-    norm = colors.Normalize(vmin=0.0, vmax=1.0)
-    im = ax.imshow(masked_norm, aspect="auto", cmap=cmap, norm=norm)
-    ax.set_xticks(np.arange(len(combo_labels)))
-    ax.set_xticklabels(combo_labels, rotation=0, ha="center", fontsize=9)
-    ax.set_yticks(np.arange(len(metric_labels)))
-    ax.set_yticklabels(metric_labels)
-    ax.set_xlabel("Alpha / rho combinations")
-    ax.set_ylabel("Metric")
-    ax.set_title("Cross-fold averages per hyperparameter set")
-    cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.04)
-    cbar.set_label("Row-normalized value")
+#     masked_norm = np.ma.masked_invalid(normalized)
+#     fig_width = max(9.0, min(0.6 * len(combo_labels), 24.0))
+#     fig_height = max(3.5, 0.6 * len(metric_labels))
+#     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+#     norm = colors.Normalize(vmin=0.0, vmax=1.0)
+#     im = ax.imshow(masked_norm, aspect="auto", cmap=cmap, norm=norm)
+#     ax.set_xticks(np.arange(len(combo_labels)))
+#     ax.set_xticklabels(combo_labels, rotation=0, ha="center", fontsize=9)
+#     ax.set_yticks(np.arange(len(metric_labels)))
+#     ax.set_yticklabels(metric_labels)
+#     ax.set_xlabel("Alpha / rho combinations")
+#     ax.set_ylabel("Metric")
+#     ax.set_title("Cross-fold averages per hyperparameter set")
+#     cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.04)
+#     cbar.set_label("Row-normalized value")
 
-    def _format_display(label, value):
-        if not np.isfinite(value):
-            return "–"
-        label_lower = label.lower()
-        if "loss" in label_lower:
-            if abs(value) >= 1e3 or abs(value) < 1e-2:
-                return f"{value:.2e}"
-            return f"{value:.3f}"
-        if "p-value" in label_lower or label_lower.endswith("(p)"):
-            return f"{value:.3f}"
-        return f"{value:.3f}"
+#     def _format_display(label, value):
+#         if not np.isfinite(value):
+#             return "–"
+#         label_lower = label.lower()
+#         if "loss" in label_lower:
+#             if abs(value) >= 1e3 or abs(value) < 1e-2:
+#                 return f"{value:.2e}"
+#             return f"{value:.3f}"
+#         if "p-value" in label_lower or label_lower.endswith("(p)"):
+#             return f"{value:.3f}"
+#         return f"{value:.3f}"
 
-    for row_idx in range(metric_array.shape[0]):
-        for col_idx in range(metric_array.shape[1]):
-            value = metric_array[row_idx, col_idx]
-            display_text = _format_display(metric_labels[row_idx], value)
-            norm_val = normalized[row_idx, col_idx]
-            if np.isfinite(norm_val):
-                text_color = "#ffffff" if norm_val > 0.6 else "#1a1a1a"
-            else:
-                text_color = "#1a1a1a"
-            ax.text(col_idx, row_idx, display_text, ha="center", va="center",
-                    fontsize=8, color=text_color)
+#     for row_idx in range(metric_array.shape[0]):
+#         for col_idx in range(metric_array.shape[1]):
+#             value = metric_array[row_idx, col_idx]
+#             display_text = _format_display(metric_labels[row_idx], value)
+#             norm_val = normalized[row_idx, col_idx]
+#             if np.isfinite(norm_val):
+#                 text_color = "#ffffff" if norm_val > 0.6 else "#1a1a1a"
+#             else:
+#                 text_color = "#1a1a1a"
+#             ax.text(col_idx, row_idx, display_text, ha="center", va="center",
+#                     fontsize=8, color=text_color)
 
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=300)
-    plt.close(fig)
-    return output_path
+#     fig.tight_layout()
+#     fig.savefig(output_path, dpi=300)
+#     plt.close(fig)
+#     return output_path
 
 def _reshape_projection(y_values, trial_length):
     y_values = np.asarray(y_values, dtype=np.float64).ravel()
@@ -1163,6 +1163,15 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
                 bucket["train_total_loss"].append(train_total_loss)
                 bucket["test_total_loss"].append(test_total_loss)
 
+                # Track per-fold values so we can render fold-wise box/point plots later.
+                fold_metrics = fold_metric_records[metrics_key]
+                fold_metrics["train_corr"].append((fold_idx, train_metrics["pearson"]))
+                fold_metrics["test_corr"].append((fold_idx, test_metrics["pearson"]))
+                fold_metrics["train_p"].append((fold_idx, train_metrics["pearson_p"]))
+                fold_metrics["test_p"].append((fold_idx, test_metrics["pearson_p"]))
+                fold_metrics["train_total_loss"].append((fold_idx, train_total_loss))
+                fold_metrics["test_total_loss"].append((fold_idx, test_total_loss))
+
     if fold_metric_records:
         print("\n===== Saving fold-wise metric bar plots =====", flush=True)
         for metrics_key in sorted(fold_metric_records.keys()):
@@ -1226,12 +1235,14 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
             save_active_bold_correlation_map(beta_corr_avg, active_coords, volume_shape, anat_img, avg_prefix,
                                              result_prefix=f"active_beta_corr_mean_{metric_label}", map_title=beta_title)
 
-            projection_avg = _compute_weighted_projection(weights_avg, projection_data["beta_clean"])
-            avg_plot_path = f"y_projection_beta_{avg_prefix}.png"
-            plot_projection_beta_sweep([(rho_value, projection_avg)], task_alpha, bold_alpha, beta_alpha, avg_plot_path,
-                                       series_label="Voxel space (weights avg)")
+            beta_projection_avg = _compute_weighted_projection(weights_avg, projection_data["beta_clean"])
+            bold_projection_flat, _ = _compute_weighted_active_bold_projection(weights_avg, {"active_bold": projection_data["bold_clean"]})
+            _, bold_projection_trials = _reshape_projection(bold_projection_flat, trial_len)
+            avg_plot_path = f"y_projection_bold_{avg_prefix}.png"
+            plot_projection_bold(bold_projection_trials, task_alpha, bold_alpha, beta_alpha, rho_value, avg_plot_path,
+                                 series_label="Voxel space (weights avg)")
             avg_series_key = (task_alpha, bold_alpha, beta_alpha)
-            fold_avg_projection_series[avg_series_key].append((rho_value, projection_avg))
+            fold_avg_projection_series[avg_series_key].append((rho_value, beta_projection_avg))
 
         if fold_avg_projection_series:
             for avg_series_key in sorted(fold_avg_projection_series.keys()):
