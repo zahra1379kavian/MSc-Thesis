@@ -116,8 +116,8 @@ beta_glm = _asarray_filled(glm_dict["betasmd"], dtype=np.float32)
 nan_mask_flat_run1 = np.load(f"nan_mask_flat_sub{sub}_ses{ses}_run1.npy")
 nan_mask_flat_run2 = np.load(f"nan_mask_flat_sub{sub}_ses{ses}_run2.npy")
 
-beta_volume_filtered_run1 = np.load(f"{base_path}/cleaned_beta_volume_sub{sub}_ses{ses}_run1.npy")
-beta_volume_filtered_run2 = np.load(f"{base_path}/cleaned_beta_volume_sub{sub}_ses{ses}_run2.npy")
+# beta_volume_filtered_run1 = np.load(f"{base_path}/cleaned_beta_volume_sub{sub}_ses{ses}_run1.npy")
+# beta_volume_filtered_run2 = np.load(f"{base_path}/cleaned_beta_volume_sub{sub}_ses{ses}_run2.npy")
 beta_filtered_run1  = np.load(f"beta_volume_filter_sub{sub}_ses{ses}_run1.npy") 
 beta_filtered_run2  = np.load(f"beta_volume_filter_sub{sub}_ses{ses}_run2.npy") 
 
