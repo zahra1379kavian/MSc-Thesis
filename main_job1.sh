@@ -19,4 +19,4 @@ export HOME=/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis
 source /scratch/st-mmckeown-1/zkavian/fmri_models/myenv/bin/activate
 cd /scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/
 
-python main_bootstrap.py
+python test.py

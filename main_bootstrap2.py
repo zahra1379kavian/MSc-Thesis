@@ -13,7 +13,9 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 from nilearn import plotting
+from scipy import sparse
 from scipy.io import loadmat
+from scipy.spatial import cKDTree
 from scipy.stats import t as student_t
 import pingouin as pg
 
@@ -90,6 +92,36 @@ def combine_filtered_betas(beta_run1, beta_run2, nan_mask_flat, flat_indices=Non
     print(f"Removed voxels with all-NaN trials: {removed_voxels}", flush=True)
     return beta_combined, nan_mask_flat
 
+def mask_anatomical_image(anat_img, mask_flat, volume_shape):
+    anat_data = anat_img.get_fdata()
+    mask_flat = mask_flat.ravel()
+    mask_3d = mask_flat.reshape(volume_shape)
+    anat_data = np.where(mask_3d, np.nan, anat_data)
+    return anat_data
+
+def compute_distance_weighted_adjacency(coords, affine, radius_mm=3.0, sigma_mm=None):
+    if sigma_mm is None:
+        sigma_mm = radius_mm / 2.0
+    coord_array = np.column_stack(coords).astype(np.float32, copy=False)
+    coords_mm = nib.affines.apply_affine(affine, coord_array)
+    tree = cKDTree(coords_mm)
+    dist_matrix = tree.sparse_distance_matrix(tree, max_distance=radius_mm, output_type="coo_matrix")
+    rows = dist_matrix.row
+    cols = dist_matrix.col
+    data = dist_matrix.data
+    if data.size:
+        off_diag = rows != cols
+        rows = rows[off_diag]
+        cols = cols[off_diag]
+        data = data[off_diag]
+    weights = np.exp(-(data ** 2) / (sigma_mm ** 2))
+    adjacency = sparse.csr_matrix((weights, (rows, cols)), shape=(coords_mm.shape[0], coords_mm.shape[0]))
+    if adjacency.nnz:
+        adjacency = adjacency.maximum(adjacency.T)
+    degrees = np.asarray(adjacency.sum(axis=1)).ravel()
+    degree_matrix = sparse.diags(degrees)
+    return adjacency, degree_matrix
+
 # %% 
 ses = 1
 sub = "04"
@@ -134,6 +166,7 @@ bold_data_run1 = np.load(join(base_path, f'fmri_sub{sub}_ses{ses}_run1.npy'))
 bold_data_run2 = np.load(join(base_path, f'fmri_sub{sub}_ses{ses}_run2.npy'))
 clean_active_bold_run1 = np.load(f"active_bold_sub{sub}_ses{ses}_run1.npy")
 clean_active_bold_run2 = np.load(f"active_bold_sub{sub}_ses{ses}_run2.npy")
+volume_shape = bold_data_run1.shape[:3]
 
 
 # mask_3d = nan_mask_flat.reshape(mask_volume_shape)
@@ -151,13 +184,33 @@ active_coords_run2 = np.load(f"active_coords_sub{sub}_ses{ses}_run2.npy", allow_
 
 active_flat_idx, shared_coords, bold_clean = combine_active_run_data(active_coords_run1, active_coords_run2, 
                                                                                clean_active_bold_run1, clean_active_bold_run2,
-                                                                               bold_data_run1.shape[:3], shared_nan_mask_flat)
+                                                                               volume_shape, shared_nan_mask_flat)
 
 active_coords = np.asarray(shared_coords, dtype=object)
 print(f"Combined active_flat_idx: {active_flat_idx.shape}", flush=True)
 print(f"Combined clean_active_bold: {bold_clean.shape}", flush=True)
 print(f"Combined active_coords: {active_coords.shape}", flush=True)
 
+# Mask anatomical volume to the functional voxel set and compute adjacency/degree matrices.
+masked_anat = mask_anatomical_image(anat_img, shared_nan_mask_flat, volume_shape)
+masked_active_anat = masked_anat.ravel()[active_flat_idx]
+finite_anat = masked_active_anat[np.isfinite(masked_active_anat)]
+anat_range = (float(np.min(finite_anat)), float(np.max(finite_anat))) if finite_anat.size else (np.nan, np.nan)
+print(f"Masked anatomical volume shape: {masked_anat.shape}, active voxels: {masked_active_anat.size}", flush=True)
+print(f"Masked anatomical intensity range (finite): [{anat_range[0]}, {anat_range[1]}]", flush=True)
+
+adjacency_radius_mm = 3.0
+adjacency_sigma_mm = adjacency_radius_mm / 2.0
+adjacency_matrix, degree_matrix = compute_distance_weighted_adjacency(shared_coords, anat_img.affine,
+                                                                      radius_mm=adjacency_radius_mm,
+                                                                      sigma_mm=adjacency_sigma_mm)
+adj_data = adjacency_matrix.data
+adj_range = (float(adj_data.min()), float(adj_data.max())) if adj_data.size else (0.0, 0.0)
+degree_values = degree_matrix.data.ravel()
+degree_range = (float(degree_values.min()), float(degree_values.max())) if degree_values.size else (0.0, 0.0)
+print(f"Adjacency matrix (distance-weighted) shape: {adjacency_matrix.shape}, nnz={adjacency_matrix.nnz}, range: [{adj_range[0]}, {adj_range[1]}]", flush=True)
+print(f"Degree matrix shape: {degree_matrix.shape}, range: [{degree_range[0]}, {degree_range[1]}]", flush=True)
+laplacian_matrix = degree_matrix - adjacency_matrix
 # %%
 behav_data = loadmat(f"{base_path}/PSPD0{sub}_OFF_behav_metrics.mat" if ses == 1 else f"{base_path}/PSPD0{sub}_ON_behav_metrics.mat")
 behav_metrics = behav_data["behav_metrics"]
