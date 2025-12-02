@@ -868,7 +868,7 @@ solver_name = "MOSEK"
 penalty_sweep = [(0.5, 0.7, 0.25, 0.8)]
 alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha, "smooth_penalty": smooth_alpha} for task_alpha, bold_alpha, beta_alpha, smooth_alpha in penalty_sweep]
 # gamma_sweep = [0, 0.2, 0.8]
-gamma_sweep = [0.001]
+gamma_sweep = [0.2]
 SAVE_PER_FOLD_VOXEL_MAPS = False  # disable individual fold voxel-weight plots; averages saved later
 
 projection_data = build_pca_dataset(bold_clean, beta_clean, behavior_matrix, nan_mask_flat, active_coords, active_flat_idx, trial_len, num_trials)
@@ -1074,46 +1074,32 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 f"avg loss train={train_loss_mean:.4f}, test={test_loss_mean:.4f}", flush=True)
 
 
+DEFAULT_NUM_FOLDS = 5
+
+
 if __name__ == "__main__":
-    combo_idx = args.combo_idx
-    if combo_idx is None:
-        env_combo = os.environ.get("SLURM_ARRAY_TASK_ID")
-        if env_combo is not None:
-            try:
-                combo_idx = int(env_combo)
-            except ValueError as exc:
-                raise ValueError("SLURM_ARRAY_TASK_ID must be an integer when provided.") from exc
+    combo_idx = None
+    combo_env = os.environ.get("FMRI_COMBO_IDX") or os.environ.get("SLURM_ARRAY_TASK_ID")
+    if combo_env not in (None, ""):
+        combo_idx = int(combo_env)
 
     selected_alphas = alpha_sweep
     selected_gammas = gamma_sweep
-
     if combo_idx is not None:
         total = len(alpha_sweep) * len(gamma_sweep)
-        if not 0 <= combo_idx < total:
-            raise ValueError(f"combo_idx must be in [0, {total})")
         alpha_idx, gamma_idx = divmod(combo_idx, len(gamma_sweep))
         selected_alphas = [alpha_sweep[alpha_idx]]
         selected_gammas = [gamma_sweep[gamma_idx]]
         print(f"Running combo_idx={combo_idx} (alpha_idx={alpha_idx}, gamma_idx={gamma_idx})", flush=True)
     else:
-        if args.alpha_idx is not None:
-            if not 0 <= args.alpha_idx < len(alpha_sweep):
-                raise ValueError("alpha_idx out of range")
-            selected_alphas = [alpha_sweep[args.alpha_idx]]
-            print(f"Running alpha_idx={args.alpha_idx}", flush=True)
-        if args.gamma_idx is not None:
-            if not 0 <= args.gamma_idx < len(gamma_sweep):
-                raise ValueError("gamma_idx out of range")
-            selected_gammas = [gamma_sweep[args.gamma_idx]]
-            print(f"Running gamma_idx={args.gamma_idx}", flush=True)
+        print("Running full alpha/gamma sweep (no combo index provided).", flush=True)
 
-    if args.num_folds < 1:
-        raise ValueError("num_folds must be >= 1")
-    if args.num_folds > trials_per_run:
-        raise ValueError("num_folds cannot exceed trials_per_run.")
+    num_folds_env = os.environ.get("FMRI_NUM_FOLDS", "").strip()
+    if num_folds_env:
+        num_folds = int(num_folds_env)
+    else:
+        num_folds = DEFAULT_NUM_FOLDS
 
-    fold_splits = build_custom_kfold_splits(num_trials, num_folds=args.num_folds, trials_per_run=trials_per_run)
-    print(f"Constructed {len(fold_splits)} fold pairs using num_folds={args.num_folds} per run.", flush=True)
+    fold_splits = build_custom_kfold_splits(num_trials, num_folds=num_folds, trials_per_run=trials_per_run)
+    print(f"Constructed {len(fold_splits)} fold pairs using num_folds={num_folds} per run.", flush=True)
     run_cross_run_experiment(selected_alphas, selected_gammas, fold_splits, projection_data)
-
-# # %%
