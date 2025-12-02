@@ -119,7 +119,7 @@ def compute_distance_weighted_adjacency(coords, affine, radius_mm=3.0, sigma_mm=
     if adjacency.nnz:
         adjacency = adjacency.maximum(adjacency.T)
     degrees = np.asarray(adjacency.sum(axis=1)).ravel()
-    degree_matrix = sparse.diags(degrees)
+    degree_matrix = sparse.diags(degrees).tocsr()  # CSR keeps diagonal structure but allows slicing.
     return adjacency, degree_matrix
 
 # %% 
@@ -353,10 +353,14 @@ def build_projection_dataset(bold_clean, beta_clean, behavioral_matrix, nan_mask
     bold_pca_trials = bold_pca_components.reshape(bold_pca_components.shape[0], num_trials, trial_length)
     coeff_pinv = np.linalg.pinv(pca_model.coeff)
     beta_pca_full = coeff_pinv @ np.nan_to_num(beta_clean)
+    # C_smooth = _build_smooth_penalty(coeff_pinv, laplacian_matrix)
+    C_smooth = coeff_pinv @ laplacian_matrix
+    if C_smooth is not None:
+        print(f"Smoothness penalty matrix (component space) shape: {C_smooth.shape}", flush=True)
 
     return {"pca_model": pca_model, "bold_pca_trials": bold_pca_trials, "coeff_pinv": coeff_pinv, "beta_pca_full": beta_pca_full, 
             "bold_clean": bold_clean, "beta_clean": beta_clean, "behavior_matrix": behavioral_matrix, "nan_mask_flat": nan_mask_flat, 
-            "active_coords": active_coords, "active_flat_indices": active_flat_indices}
+            "active_coords": active_coords, "active_flat_indices": active_flat_indices, "C_smooth": C_smooth}
 
 def prepare_data_func(projection_data, trial_indices, trial_length, run_boundary):
     trial_indices = np.asarray(trial_indices, dtype=np.int64)
@@ -376,8 +380,10 @@ def prepare_data_func(projection_data, trial_indices, trial_length, run_boundary
     C_task = standardize_matrix(C_task)
     C_bold = standardize_matrix(C_bold)
     C_beta = standardize_matrix(C_beta)
-    print(f"shape: {C_task.shape}, {C_bold.shape}, {C_beta.shape}", flush=True)
-    print(f"Range: [{np.min(C_task)}, {np.max(C_task)}], [{np.min(C_bold)}, {np.max(C_bold)}],[{np.min(C_beta)}, {np.max(C_beta)}]", flush=True)
+    C_smooth = standardize_matrix(laplacian_matrix)
+    print(f"shape: {C_task.shape}, {C_bold.shape}, {C_beta.shape}, {C_smooth.shape}", flush=True)
+    print(f"Range: [{np.min(C_task)}, {np.max(C_task)}], [{np.min(C_bold)},"
+          f"{np.max(C_bold)}],[{np.min(C_beta)}, {np.max(C_beta)}], [{np.max(C_smooth)}, {np.min(C_smooth)}]", flush=True)
 
     trial_mask = np.isfinite(behavior_vector)
     behavior_observed = behavior_vector[trial_mask]
@@ -402,32 +408,33 @@ def prepare_data_func(projection_data, trial_indices, trial_length, run_boundary
         "coeff_pinv": projection_data["coeff_pinv"], "beta_centered": beta_centered,
         "behavior_centered": behavior_centered, "normalized_behaviors": normalized_behaviors,
         "behavior_observed": behavior_observed, "beta_observed": beta_observed,
-        "beta_clean": beta_subset, "C_task": C_task, "C_bold": C_bold, "C_beta": C_beta,
+        "beta_clean": beta_subset, "C_task": C_task, "C_bold": C_bold, "C_beta": C_beta, "C_smooth": C_smooth,
         "active_bold": bold_subset, "trial_indices": trial_indices, "num_trials": effective_num_trials}
 
-def calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta):
+def calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth):
     beta_centered = run_data["beta_centered"]
     n_components = beta_centered.shape[0]
     task_penalty = alpha_task * run_data["C_task"]
     bold_penalty = alpha_bold * run_data["C_bold"]
     beta_penalty = alpha_beta * run_data["C_beta"]
-    total_penalty = task_penalty + bold_penalty + beta_penalty
+    smooth_penalty = alpha_smooth * run_data["C_smooth"]
+    total_penalty = task_penalty + bold_penalty + beta_penalty + smooth_penalty
     total_penalty = 0.5 * (total_penalty + total_penalty.T)
     total_penalty = total_penalty + 1e-6 * np.eye(n_components)
 
-    return {"task": task_penalty, "bold": bold_penalty, "beta": beta_penalty}, total_penalty
+    return {"task": task_penalty, "bold": bold_penalty, "beta": beta_penalty, "smooth": smooth_penalty}, total_penalty
 
 def _total_loss_from_penalty(weights, total_penalty):
     weights = np.asarray(weights, dtype=np.float64).ravel()
     weights = np.where(np.isfinite(weights), weights, 0.0)
     return float(weights.T @ total_penalty @ weights)
 
-def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, solver_name, phro): # I should change this function
+def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, solver_name, phro, alpha_smooth): # I should change this function
     beta_centered = run_data["beta_centered"]
     normalized_behaviors = run_data["normalized_behaviors"]
     n_components = beta_centered.shape[0]
 
-    penalty_matrices, total_penalty = calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta)
+    penalty_matrices, total_penalty = calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth)
 
     weights_positive = cp.Variable(n_components)
     weights_negative = cp.Variable(n_components)
@@ -1081,11 +1088,12 @@ solver_name = "MOSEK"
 # bold_penalty_sweep = [0.25, 0.5]
 # beta_penalty_sweep = [50, 0.25]
 
-penalty_sweep = [(0.5, 0.25, 0.25), (0.5, 0.25, 50), (0.25, 0.5, 0.25), (0.25, 0.5, 50), (50, 50, 0.25), (50, 50, 50)]
-# penalty_sweep = [(0.5, 0.25, 0.25)]
+# penalty_sweep = [(0.5, 0.25, 0.25, 0.2), (0.5, 0.25, 50), (0.25, 0.5, 0.25), (0.25, 0.5, 50), (50, 50, 0.25), (50, 50, 50)]
+penalty_sweep = [(0.5, 0.25, 0.25, 0.2)]
 
-alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha}
-    for task_alpha, bold_alpha, beta_alpha in penalty_sweep]
+smooth_penalty_weight = 1.0
+alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha, "smooth_penalty": smooth_alpha}
+    for task_alpha, bold_alpha, beta_alpha, smooth_alpha in penalty_sweep]
 # rho_sweep = [0.2, 0.6, 0.8]
 rho_sweep = [0.2, 0.6]
 trial_downsample_metric = "median"
@@ -1160,14 +1168,15 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
             task_alpha = alpha_setting["task_penalty"]
             bold_alpha = alpha_setting["bold_penalty"]
             beta_alpha = alpha_setting["beta_penalty"]
-            alpha_prefix = f"fold{fold_idx}_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}"
+            smooth_alpha = alpha_setting["smooth_penalty"]
+            alpha_prefix = f"fold{fold_idx}_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_smooth{smooth_alpha:g}"
 
             for rho_value in rho_values:
-                metrics_key = (task_alpha, bold_alpha, beta_alpha, rho_value)
-                combo_label = (f"task={task_alpha:g}, bold={bold_alpha:g}, beta={beta_alpha:g}, rho={rho_value:g}")
+                metrics_key = (task_alpha, bold_alpha, beta_alpha, smooth_alpha, rho_value)
+                combo_label = (f"task={task_alpha:g}, bold={bold_alpha:g}, beta={beta_alpha:g}, smooth={smooth_alpha:g}, rho={rho_value:g}")
                 sweep_suffix = f"{alpha_prefix}_rho{rho_value:g}"
-                print(f"Fold {fold_idx}: optimization with task={task_alpha}, bold={bold_alpha}, beta={beta_alpha}, rho={rho_value}", flush=True)
-                solution = solve_soc_problem(train_data, task_alpha, bold_alpha, beta_alpha, solver_name, rho_value)
+                print(f"Fold {fold_idx}: optimization with task={task_alpha}, bold={bold_alpha}, beta={beta_alpha}, smooth={smooth_alpha}, rho={rho_value}", flush=True)
+                solution = solve_soc_problem(train_data, task_alpha, bold_alpha, beta_alpha, solver_name, rho_value, alpha_smooth=smooth_alpha)
 
                 component_weights = np.abs(solution["weights"])
                 coeff_pinv = np.asarray(train_data["coeff_pinv"])
@@ -1193,9 +1202,9 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
                 weights = np.asarray(solution["weights"], dtype=np.float64)
                 train_total_loss = solution.get("total_loss")
                 if train_total_loss is None:
-                    _, train_total_penalty = calcu_penalty_terms(train_data, task_alpha, bold_alpha, beta_alpha)
+                    _, train_total_penalty = calcu_penalty_terms(train_data, task_alpha, bold_alpha, beta_alpha, smooth_alpha)
                     train_total_loss = _total_loss_from_penalty(weights, train_total_penalty)
-                _, total_penalty = calcu_penalty_terms(test_data, task_alpha, bold_alpha, beta_alpha)
+                _, total_penalty = calcu_penalty_terms(test_data, task_alpha, bold_alpha, beta_alpha, smooth_alpha)
                 test_total_loss = _total_loss_from_penalty(weights, total_penalty)
                 train_metrics["total_loss"] = train_total_loss
                 test_metrics["total_loss"] = test_total_loss
@@ -1207,7 +1216,7 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
                 print(f"  Train metrics -> corr: {train_metrics['pearson']:.4f}, R2: {train_metrics['r2']:.4f}", flush=True)
                 print(f"  Test metrics  -> corr: {test_metrics['pearson']:.4f}, R2: {test_metrics['r2']:.4f}", flush=True)
 
-                metrics_key = (task_alpha, bold_alpha, beta_alpha, rho_value)
+                metrics_key = (task_alpha, bold_alpha, beta_alpha, smooth_alpha, rho_value)
                 bucket = aggregate_metrics[metrics_key]
                 bucket["train_corr"].append(train_metrics["pearson"])
                 bucket["train_p"].append(train_metrics["pearson_p"])
@@ -1228,9 +1237,9 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
     if fold_metric_records:
         print("\n===== Saving fold-wise metric bar plots =====", flush=True)
         for metrics_key in sorted(fold_metric_records.keys()):
-            task_alpha, bold_alpha, beta_alpha, rho_value = metrics_key
-            combo_label = (f"task={task_alpha:g}, bold={bold_alpha:g}, beta={beta_alpha:g}, rho={rho_value:g}")
-            metrics_prefix = (f"foldmetrics_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_rho{rho_value:g}")
+            task_alpha, bold_alpha, beta_alpha, smooth_alpha, rho_value = metrics_key
+            combo_label = (f"task={task_alpha:g}, bold={bold_alpha:g}, beta={beta_alpha:g}, smooth={smooth_alpha:g}, rho={rho_value:g}")
+            metrics_prefix = (f"foldmetrics_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_smooth{smooth_alpha:g}_rho{rho_value:g}")
             metric_records = fold_metric_records[metrics_key]
             train_loss_entries = metric_records.get("train_total_loss", [])
             test_loss_entries = metric_records.get("test_total_loss", [])
@@ -1260,9 +1269,9 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
         volume_shape = anat_img.shape[:3]
         fold_avg_projection_series = defaultdict(list)
         for metrics_key in sorted(fold_output_tracker.keys()):
-            task_alpha, bold_alpha, beta_alpha, rho_value = metrics_key
+            task_alpha, bold_alpha, beta_alpha, smooth_alpha, rho_value = metrics_key
             fold_outputs = fold_output_tracker[metrics_key]
-            avg_prefix = f"foldavg_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_rho{rho_value:g}"
+            avg_prefix = f"foldavg_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_smooth{smooth_alpha:g}_rho{rho_value:g}"
 
             weights_stack = np.stack(fold_outputs["voxel_weights"], axis=0)
             weights_avg = np.nanmean(weights_stack, axis=0)
@@ -1294,14 +1303,14 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
             avg_plot_path = f"y_projection_bold_{avg_prefix}.png"
             plot_projection_bold(bold_projection_trials, task_alpha, bold_alpha, beta_alpha, rho_value, avg_plot_path,
                                  series_label="Voxel space (weights avg)")
-            avg_series_key = (task_alpha, bold_alpha, beta_alpha)
+            avg_series_key = (task_alpha, bold_alpha, beta_alpha, smooth_alpha)
             fold_avg_projection_series[avg_series_key].append((rho_value, beta_projection_avg))
 
         if fold_avg_projection_series:
             for avg_series_key in sorted(fold_avg_projection_series.keys()):
-                task_alpha, bold_alpha, beta_alpha = avg_series_key
+                task_alpha, bold_alpha, beta_alpha, smooth_alpha = avg_series_key
                 rho_series = fold_avg_projection_series[avg_series_key]
-                avg_base_prefix = f"foldavg_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}"
+                avg_base_prefix = f"foldavg_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_smooth{smooth_alpha:g}"
                 avg_series_storage = f"rho_series_voxel_{avg_base_prefix}.npy"
                 existing_avg = _load_projection_series(avg_series_storage)
                 merged_avg = _merge_projection_series(existing_avg, rho_series)
@@ -1321,7 +1330,7 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
         # heatmap_combo_labels = []
 
         for metrics_key in sorted(aggregate_metrics.keys()):
-            task_alpha, bold_alpha, beta_alpha, rho_value = metrics_key
+            task_alpha, bold_alpha, beta_alpha, smooth_alpha, rho_value = metrics_key
             bucket = aggregate_metrics[metrics_key]
             train_corr_mean = _safe_mean(bucket["train_corr"])
             train_p_mean = _safe_mean(bucket["train_p"])
@@ -1330,14 +1339,14 @@ def run_cross_run_experiment(alpha_settings, rho_values, fold_splits, projection
             train_loss_mean = _safe_mean(bucket["train_total_loss"])
             test_loss_mean = _safe_mean(bucket["test_total_loss"])
             fold_count = len(bucket["test_corr"])
-            combo_label = (f"task={task_alpha:g}\n bold={bold_alpha:g}\n beta={beta_alpha:g}\n rho={rho_value:g}")
+            combo_label = (f"task={task_alpha:g}\n bold={bold_alpha:g}\n beta={beta_alpha:g}\n smooth={smooth_alpha:g}\n rho={rho_value:g}")
             # heatmap_combo_labels.append(combo_label)
             metric_summary = {"train_corr": train_corr_mean, "test_corr": test_corr_mean, "train_p": train_p_mean,
                               "test_p": test_p_mean, "train_total_loss": train_loss_mean, "test_total_loss": test_loss_mean}
             for metric_key, _ in heatmap_metric_defs:
                 heatmap_storage[metric_key].append(metric_summary.get(metric_key, np.nan))
 
-            print(f"task={task_alpha:g}, bold={bold_alpha:g}, beta={beta_alpha:g}, rho={rho_value:g} "
+            print(f"task={task_alpha:g}, bold={bold_alpha:g}, beta={beta_alpha:g}, smooth={smooth_alpha:g}, rho={rho_value:g} "
                 f"(folds contributing={fold_count}): "
                 f"train corr={train_corr_mean:.4f} (p={train_p_mean:.4f}), "
                 f"test corr={test_corr_mean:.4f} (p={test_p_mean:.4f}), "

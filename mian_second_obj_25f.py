@@ -19,59 +19,44 @@ from scipy.spatial import cKDTree
 from scipy.stats import t as student_t
 import pingouin as pg
 
-# %%
-def _asarray_filled(data, dtype=np.float32):
-    if isinstance(data, np.ma.MaskedArray):
-        data = data.filled(np.nan)
-    return data
 
 def synchronize_beta_voxels(beta_run1, beta_run2, mask_run1, mask_run2):
-    mask_run1 = mask_run1.ravel()
-    mask_run2 = mask_run2.ravel()
-    valid_run1 = ~mask_run1
-    valid_run2 = ~mask_run2
+    valid_run1, valid_run2 = ~mask_run1, ~mask_run2
     shared_valid = valid_run1 & valid_run2
+    shared_mask_run1 = shared_valid[np.flatnonzero(valid_run1)] #indices of nonzero elements in mask_run1
+    shared_mask_run2 = shared_valid[np.flatnonzero(valid_run2)]
 
-    run1_indices = np.flatnonzero(valid_run1)
-    run2_indices = np.flatnonzero(valid_run2)
-    shared_mask_run1 = shared_valid[run1_indices]
-    shared_mask_run2 = shared_valid[run2_indices]
-
-    synced_run1 = beta_run1[shared_mask_run1]
-    synced_run2 = beta_run2[shared_mask_run2]
+    synced_run1, synced_run2 = beta_run1[shared_mask_run1], beta_run2[shared_mask_run2]
     removed_run1 = beta_run1.shape[0] - synced_run1.shape[0]
     removed_run2 = beta_run2.shape[0] - synced_run2.shape[0]
-    if removed_run1 > 0 or removed_run2 > 0:
-        print(f"Removed {removed_run1} run1 voxels and {removed_run2} run2 voxels to enforce a shared voxel set.",
-            flush=True)
+    print(f"Removed {removed_run1} run1 voxels and {removed_run2} run2 voxels to enforce a shared voxel set.", flush=True)
 
     shared_flat_indices = np.flatnonzero(shared_valid)
-
     combined_nan_mask = mask_run1 | mask_run2
     return synced_run1, synced_run2, combined_nan_mask, shared_flat_indices
 
-def combine_active_run_data(coords_run1, coords_run2, bold_run1, bold_run2, volume_shape, invalid_flat_mask=None):
-    coords_run1 = tuple(np.asarray(axis, dtype=np.int64) for axis in coords_run1)
-    coords_run2 = tuple(np.asarray(axis, dtype=np.int64) for axis in coords_run2)
-
+def combine_active_run_data(coords_run1, coords_run2, bold_run1, bold_run2, volume_shape, shared_nan_mask_flat):
+    coords_run1 = tuple(axis for axis in coords_run1)
+    coords_run2 = tuple(axis for axis in coords_run2)
+    # Collapse (x, y, z) coordinates into single flat indices for practical set operations.
     flat_run1 = np.ravel_multi_index(coords_run1, volume_shape)
     flat_run2 = np.ravel_multi_index(coords_run2, volume_shape)
+
+    # Only keep voxels that exist in both runs and are not masked out by NaNs.
     shared_flat = np.intersect1d(flat_run1, flat_run2, assume_unique=False)
-    if invalid_flat_mask is not None:
-        invalid_flat_mask = invalid_flat_mask.ravel()
-        shared_flat = shared_flat[~invalid_flat_mask[shared_flat]]
-
+    shared_flat = shared_flat[~shared_nan_mask_flat[shared_flat]]
     shared_coords = np.unravel_index(shared_flat, volume_shape)
-    shared_coords = tuple(np.asarray(axis, dtype=np.int64) for axis in shared_coords)
+    shared_coords = tuple(axis for axis in shared_coords)
 
+    # Sorting once lets np.searchsorted perform vectorized index lookup back into each run.
     sorter1 = np.argsort(flat_run1)
     sorter2 = np.argsort(flat_run2)
     sorted_flat_run1 = flat_run1[sorter1]
     sorted_flat_run2 = flat_run2[sorter2]
     idx_run1 = sorter1[np.searchsorted(sorted_flat_run1, shared_flat)]
     idx_run2 = sorter2[np.searchsorted(sorted_flat_run2, shared_flat)]
+    # Concatenate matching voxel time courses from the two runs to build the joint dataset.
     combined_bold = np.concatenate((bold_run1[idx_run1], bold_run2[idx_run2]), axis=1)
-
     return shared_flat, shared_coords, combined_bold
 
 def combine_filtered_betas(beta_run1, beta_run2, nan_mask_flat, flat_indices=None):
@@ -142,7 +127,7 @@ csf_mask = nib.load(csf_mask_path).get_fdata().astype(np.float16)
 gray_mask = nib.load(gray_mask_path).get_fdata().astype(np.float16)
 
 glm_dict = np.load(f"{base_path}/TYPED_FITHRF_GLMDENOISE_RR_sub{sub}.npy", allow_pickle=True).item()
-beta_glm = _asarray_filled(glm_dict["betasmd"], dtype=np.float32)
+beta_glm = glm_dict["betasmd"]
 
 nan_mask_flat_run1 = np.load(f"nan_mask_flat_sub{sub}_ses{ses}_run1.npy")
 nan_mask_flat_run2 = np.load(f"nan_mask_flat_sub{sub}_ses{ses}_run2.npy")
@@ -558,7 +543,6 @@ def evaluate_projection(data, weights):
 
 def _compute_weighted_active_bold_projection(voxel_weights, data):
     active_bold = data.get("active_bold")
-    active_bold = _asarray_filled(active_bold)
     bold_matrix = active_bold.reshape(active_bold.shape[0], -1).copy()
     voxel_means = np.nanmean(bold_matrix, axis=1, keepdims=True)
     voxel_means = np.where(np.isfinite(voxel_means), voxel_means, 0.0)
@@ -586,8 +570,6 @@ def _describe_trial_metric(metric):
     return getattr(metric, "__name__", "custom_metric")
 
 def _safe_pearsonr(x, y, return_p=False):
-    x = _asarray_filled(x, dtype=np.float64).ravel()
-    y = _asarray_filled(y, dtype=np.float64).ravel()
     if x.size != y.size or x.size < 2:
         return (np.nan, np.nan) if return_p else np.nan
     finite_mask = np.isfinite(x) & np.isfinite(y)
@@ -619,9 +601,8 @@ def _safe_pearsonr(x, y, return_p=False):
 
 def _aggregate_trials(active_bold, reducer):
     # downsample bold data by reducer metrice
-    bold_trials = _asarray_filled(active_bold, dtype=np.float64)
-    num_voxels, num_trials, trial_length = bold_trials.shape
-    reshaped = bold_trials.reshape(-1, trial_length)
+    num_voxels, num_trials, trial_length = active_bold.shape
+    reshaped = active_bold.reshape(-1, trial_length)
     finite_counts = np.count_nonzero(np.isfinite(reshaped), axis=1)
     valid_mask = finite_counts > 0
     reduced_flat = np.full(reshaped.shape[0], np.nan, dtype=np.float64)
@@ -632,9 +613,8 @@ def _aggregate_trials(active_bold, reducer):
         reduced_flat[valid_mask] = np.asarray(reduced_values, dtype=np.float64).ravel()
     return reduced_flat.reshape(num_voxels, num_trials)
 
-def _compute_weighted_projection(voxel_weights, voxel_measurements):
+def _compute_weighted_projection(voxel_weights, measurements):
     weights = np.asarray(voxel_weights, dtype=np.float64).ravel()
-    measurements = _asarray_filled(voxel_measurements, dtype=np.float64)
     if measurements.ndim != 2:
         measurements = measurements.reshape(measurements.shape[0], -1)
     finite_mask = np.isfinite(measurements)
@@ -658,11 +638,10 @@ def compute_component_active_beta_correlation(voxel_weights, data, aggregation="
     # corr(weight * beta, bold)
     active_beta = data.get("beta_clean")
     active_bold = data.get("active_bold")
-    beta_matrix = _asarray_filled(active_beta, dtype=np.float64)
     reducer = _resolve_trial_metric(aggregation)
     bold_trial_metric = _aggregate_trials(active_bold, reducer)
-    projection = _compute_weighted_projection(voxel_weights, beta_matrix)
-    correlations = np.full(beta_matrix.shape[0], np.nan, dtype=np.float32)
+    projection = _compute_weighted_projection(voxel_weights, active_beta)
+    correlations = np.full(active_beta.shape[0], np.nan, dtype=np.float32)
     projection_finite = np.isfinite(projection)
 
     for voxel_idx, voxel_series in enumerate(bold_trial_metric):

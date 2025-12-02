@@ -125,7 +125,7 @@ def compute_distance_weighted_adjacency(coords, affine, radius_mm=3.0, sigma_mm=
     if adjacency.nnz:
         adjacency = adjacency.maximum(adjacency.T)
     degrees = np.asarray(adjacency.sum(axis=1)).ravel()
-    degree_matrix = sparse.diags(degrees)
+    degree_matrix = sparse.diags(degrees).tocsr()  # Convert to CSR so downstream slicing works.
     return adjacency, degree_matrix
 
 # %% 
