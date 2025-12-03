@@ -9,27 +9,27 @@ import scipy.ndimage as ndimage
 from empca.empca.empca import empca
 
 # %%
-ses = 1
-sub = '04'
-run = 2
+ses = 2
+sub = '09'
+run = 1
 num_trials = 90
 trial_len = 9
 
-base_path = '/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis'
-anat_img = nib.load(f'/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/sub-pd0{sub}_ses-{ses}_T1w_brain.nii.gz')
+base_path = f'/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/sub{sub}'
+anat_img = nib.load(f'/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/sub{sub}/sub-pd0{sub}_ses-{ses}_T1w_brain.nii.gz')
 bold_data = np.load(join(base_path, f'fmri_sub{sub}_ses{ses}_run{run}.npy'), allow_pickle=True)
 
-mask_path = f'/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/sub-pd0{sub}_ses-{ses}_T1w_brain_mask.nii.gz'
+mask_path = f'/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/sub{sub}/sub-pd0{sub}_ses-{ses}_T1w_brain_mask.nii.gz'
 back_mask = nib.load(mask_path)
 back_mask = back_mask.get_fdata()
 back_mask = back_mask.astype(np.float16)
 
-mask_path = f'/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/sub-pd0{sub}_ses-{ses}_T1w_brain_pve_0.nii.gz'
+mask_path = f'/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/sub{sub}/sub-pd0{sub}_ses-{ses}_T1w_brain_pve_0.nii.gz'
 csf_mask = nib.load(mask_path)
 csf_mask = csf_mask.get_fdata()
 csf_mask = csf_mask.astype(np.float16)
 
-mask_path = f'/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/sub-pd0{sub}_ses-{ses}_T1w_brain_pve_1.nii.gz'
+mask_path = f'/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/sub{sub}/sub-pd0{sub}_ses-{ses}_T1w_brain_pve_1.nii.gz'
 gray_mask = nib.load(mask_path)
 gray_mask = gray_mask.get_fdata()
 gray_mask = gray_mask.astype(np.float16)
@@ -67,7 +67,7 @@ for i in range(num_trials):
 print(2, flush=True)
 # %%
 
-glm_dict = np.load(f'/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/TYPED_FITHRF_GLMDENOISE_RR_sub{sub}.npy', allow_pickle=True).item()
+glm_dict = np.load(f'/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/sub{sub}/TYPED_FITHRF_GLMDENOISE_RR_sub{sub}.npy', allow_pickle=True).item()
 beta_glm = glm_dict['betasmd']
 beta_run1, beta_run2 = beta_glm[:,0,0,:90], beta_glm[:,0,0,90:]
 
@@ -138,77 +138,77 @@ print(5, flush=True)
 # apply filter
 
 # # %%
-# def hampel_filter_image(image, window_size, threshold_factor, return_stats=False):
-#     footprint = np.ones((window_size,) * 3, dtype=bool)
-#     insufficient_any = np.zeros(image.shape[:3], dtype=bool)
-#     corrected_any = np.zeros(image.shape[:3], dtype=bool)
+def hampel_filter_image(image, window_size, threshold_factor, return_stats=False):
+    footprint = np.ones((window_size,) * 3, dtype=bool)
+    insufficient_any = np.zeros(image.shape[:3], dtype=bool)
+    corrected_any = np.zeros(image.shape[:3], dtype=bool)
 
-#     for t in range(image.shape[3]):
-#         print(f"Trial Number: {t}", flush=True)
-#         vol = image[..., t]
-#         valid = np.isfinite(vol)
+    for t in range(image.shape[3]):
+        print(f"Trial Number: {t}", flush=True)
+        vol = image[..., t]
+        valid = np.isfinite(vol)
 
-#         med = ndimage.generic_filter(vol, np.nanmedian, footprint=footprint, mode='constant', cval=np.nan).astype(np.float32)
-#         mad = ndimage.generic_filter(np.abs(vol - med), np.nanmedian, footprint=footprint, mode='constant', cval=np.nan).astype(np.float32)
-#         counts = ndimage.generic_filter(np.isfinite(vol).astype(np.float32), np.sum, footprint=footprint, mode='constant', cval=0).astype(np.float32)
-#         neighbor_count = counts - valid.astype(np.float32)
+        med = ndimage.generic_filter(vol, np.nanmedian, footprint=footprint, mode='constant', cval=np.nan).astype(np.float32)
+        mad = ndimage.generic_filter(np.abs(vol - med), np.nanmedian, footprint=footprint, mode='constant', cval=np.nan).astype(np.float32)
+        counts = ndimage.generic_filter(np.isfinite(vol).astype(np.float32), np.sum, footprint=footprint, mode='constant', cval=0).astype(np.float32)
+        neighbor_count = counts - valid.astype(np.float32)
 
-#         scaled_mad = 1.4826 * mad
-#         insufficient = valid & (neighbor_count < 3)
-#         insufficient_any |= insufficient
-#         image[..., t][insufficient] = np.nan
+        scaled_mad = 1.4826 * mad
+        insufficient = valid & (neighbor_count < 3)
+        insufficient_any |= insufficient
+        image[..., t][insufficient] = np.nan
 
-#         enough_data = (neighbor_count >= 3) & valid
-#         outliers = enough_data & (np.abs(vol - med) > threshold_factor * scaled_mad)
+        enough_data = (neighbor_count >= 3) & valid
+        outliers = enough_data & (np.abs(vol - med) > threshold_factor * scaled_mad)
 
-#         corrected_any |= outliers
-#         image[..., t][outliers] = med[outliers]
+        corrected_any |= outliers
+        image[..., t][outliers] = med[outliers]
 
-#     if return_stats:
-#         stats = {
-#             'insufficient_total': int(np.count_nonzero(insufficient_any)),
-#             'corrected_total': int(np.count_nonzero(corrected_any)),
-#         }
-#         return image, stats
+    if return_stats:
+        stats = {
+            'insufficient_total': int(np.count_nonzero(insufficient_any)),
+            'corrected_total': int(np.count_nonzero(corrected_any)),
+        }
+        return image, stats
 
-#     return image
+    return image
 
-# beta_volume_filter, hampel_stats = hampel_filter_image(clean_active_volume.astype(np.float32), window_size=5, threshold_factor=3, return_stats=True)
-# # print('Insufficient neighbours per frame:', hampel_stats['insufficient_counts'], flush=True)
-# print('Total voxels with <3 neighbours:', hampel_stats['insufficient_total'], flush=True)
-# print('Total corrected voxels:', hampel_stats['corrected_total'], flush=True)
+beta_volume_filter, hampel_stats = hampel_filter_image(clean_active_volume.astype(np.float32), window_size=5, threshold_factor=3, return_stats=True)
+# print('Insufficient neighbours per frame:', hampel_stats['insufficient_counts'], flush=True)
+print('Total voxels with <3 neighbours:', hampel_stats['insufficient_total'], flush=True)
+print('Total corrected voxels:', hampel_stats['corrected_total'], flush=True)
 
-# # beta_volume_filter = beta_volume_filter[~np.all(np.isnan(beta_volume_filter), axis=-1)]
-# # np.save(f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy', beta_volume_filter)
-
-# nan_voxels = np.all(np.isnan(beta_volume_filter), axis=-1) 
-# mask_2d = nan_voxels.reshape(-1) 
-
+# beta_volume_filter = beta_volume_filter[~np.all(np.isnan(beta_volume_filter), axis=-1)]
 # np.save(f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy', beta_volume_filter)
-# np.save(f'mask_all_nan_sub{sub}_ses{ses}_run{run}.npy', mask_2d)
+
+nan_voxels = np.all(np.isnan(beta_volume_filter), axis=-1) 
+mask_2d = nan_voxels.reshape(-1) 
+
+np.save(f'sub{sub}/cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy', beta_volume_filter)
+np.save(f'sub{sub}/mask_all_nan_sub{sub}_ses{ses}_run{run}.npy', mask_2d)
 
 ######################################################################################################################
 ######################################################################################################################
 ######################################################################################################################
 
-beta_volume_filter = np.load(f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy')
+# beta_volume_filter = np.load(f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy')
 nan_voxels = np.all(np.isnan(beta_volume_filter), axis=-1) 
 mask_2d = np.load(f'mask_all_nan_sub{sub}_ses{ses}_run{run}.npy')
-np.save(f"nan_mask_flat_sub{sub}_ses{ses}_run{run}.npy", mask_2d)
+np.save(f"sub{sub}/nan_mask_flat_sub{sub}_ses{ses}_run{run}.npy", mask_2d)
 beta_volume_clean_2d = beta_volume_filter[~nan_voxels]     
-np.save(f"beta_volume_filter_sub{sub}_ses{ses}_run{run}.npy.npy", beta_volume_clean_2d) 
+np.save(f"sub{sub}/beta_volume_filter_sub{sub}_ses{ses}_run{run}.npy.npy", beta_volume_clean_2d) 
 
 active_flat_idx = np.ravel_multi_index(active_coords, nan_voxels.shape)
-np.save(f"active_flat_indices__sub{sub}_ses{ses}_run{run}.npy", active_flat_idx)
+np.save(f"sub{sub}/active_flat_indices__sub{sub}_ses{ses}_run{run}.npy", active_flat_idx)
 keep_mask = ~mask_2d[active_flat_idx]
 clean_active_bold = clean_active_bold[keep_mask, ...]
-np.save(f"active_bold_sub{sub}_ses{ses}_run{run}.npy.npy", clean_active_bold)
+np.save(f"sub{sub}/active_bold_sub{sub}_ses{ses}_run{run}.npy.npy", clean_active_bold)
 clean_active_beta = clean_active_beta[keep_mask, ...]
 
 # Drop voxels everywhere our Hampel mask removed them
 clean_active_idx = clean_active_idx[keep_mask]
 active_coords = tuple(coord[keep_mask] for coord in active_coords)
-np.save(f"active_coords_sub{sub}_ses{ses}_run{run}.npy", active_coords)
+np.save(f"sub{sub}/active_coords_sub{sub}_ses{ses}_run{run}.npy", active_coords)
 
 # active_flat_idx = np.ravel_multi_index(active_coords, clean_active_volume.shape[:3])
 # active_keep_mask = ~mask_2d[active_flat_idx]

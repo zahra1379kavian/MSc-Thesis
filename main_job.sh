@@ -20,5 +20,5 @@ export HOME=/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis
 source /scratch/st-mmckeown-1/zkavian/fmri_models/myenv/bin/activate
 cd /scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/
 
-python mian_second_object_25folds.py --combo-idx "${SLURM_ARRAY_TASK_ID}"
+python mian_second_obj_25.py --combo-idx "${SLURM_ARRAY_TASK_ID}"
 # python matrix_diagnostics.py

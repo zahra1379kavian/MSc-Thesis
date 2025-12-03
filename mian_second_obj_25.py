@@ -141,7 +141,7 @@ clean_active_bold_run1 = np.load(f"active_bold_sub{sub}_ses{ses}_run1.npy")
 clean_active_bold_run2 = np.load(f"active_bold_sub{sub}_ses{ses}_run2.npy")
 volume_shape = bold_data_run1.shape[:3]
 active_flat_idx, active_coords, bold_clean = combine_active_run_data(active_coords_run1, active_coords_run2, clean_active_bold_run1, clean_active_bold_run2, bold_data_run1.shape[:3], shared_nan_mask_flat)
-
+active_coords = np.asarray(active_coords)
 print(f"Combined active_flat_idx: {active_flat_idx.shape}", flush=True)
 print(f"Combined clean_active_bold: {bold_clean.shape}", flush=True)
 print(f"Combined active_coords: {active_coords.shape}", flush=True)
@@ -571,7 +571,7 @@ def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth
                       method="SLSQP", options={"maxiter": 1000, "ftol": 1e-8, "disp": True})
     if not result.success:
         raise RuntimeError(f"Fractional optimizer failed: {result.message}")
-    solution_weights = result
+    solution_weights = np.asarray(result.x)
     denominator_value = solution_weights.T @ B_mat @ solution_weights
     if denominator_value < 1e-6:
         raise RuntimeError("Optimized weights violate the correlation denominator constraint.")
@@ -853,7 +853,7 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
         trial_indices = data.get("trial_indices")
     if plot_trials:
         plot_path = f"y_projection_trials_{file_prefix}.png"
-        plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, gamma_value, plot_path, series_label="Active BOLD space", trial_indices=trial_indices)
+        plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, gamma_value, plot_path, series_label="Active BOLD space", trial_indices_array=trial_indices)
 
     voxel_weights = voxel_weights.ravel()
     beta_matrix = np.nan_to_num(beta_clean, nan=0.0, posinf=0.0, neginf=0.0)
@@ -864,11 +864,11 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
 # # %%
 ridge_penalty = 1e-6
 solver_name = "MOSEK"
-# penalty_sweep = [(0.5, 0.7, 0.25, 0.8), (0, 0.7, 0.25, 0.8), (0.5, 0, 0.25, 0.8), (0.5, 0.7, 0, 0.8), (0.5, 0.7, 0.25, 0)]
-penalty_sweep = [(0.5, 0.7, 0.25, 0.8)]
+penalty_sweep = [(0.5, 0.7, 0.25, 0.8), (0, 0.7, 0.25, 0.8), (0.5, 0, 0.25, 0.8), (0.5, 0.7, 0, 0.8), (0.5, 0.7, 0.25, 0)]
+# penalty_sweep = [(0.5, 0.7, 0.25, 0.8)]
 alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha, "smooth_penalty": smooth_alpha} for task_alpha, bold_alpha, beta_alpha, smooth_alpha in penalty_sweep]
-# gamma_sweep = [0, 0.2, 0.8]
-gamma_sweep = [0.2]
+gamma_sweep = [0, 0.2, 0.8]
+# gamma_sweep = [0, 0.2]
 SAVE_PER_FOLD_VOXEL_MAPS = False  # disable individual fold voxel-weight plots; averages saved later
 
 projection_data = build_pca_dataset(bold_clean, beta_clean, behavior_matrix, nan_mask_flat, active_coords, active_flat_idx, trial_len, num_trials)
@@ -953,17 +953,17 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
 
                 metrics_key = (task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value)
                 bucket = aggregate_metrics[metrics_key]
-                bucket["train_corr"].append(train_metrics["pearson"])
+                bucket["train_corr"].append(np.abs(train_metrics["pearson"]))
                 bucket["train_p"].append(train_metrics["pearson_p"])
-                bucket["test_corr"].append(test_metrics["pearson"])
+                bucket["test_corr"].append(np.abs(test_metrics["pearson"]))
                 bucket["test_p"].append(test_metrics["pearson_p"])
                 bucket["train_total_loss"].append(train_total_loss)
                 bucket["test_total_loss"].append(test_total_loss)
 
                 fold_metrics = fold_metric_records[metrics_key]
-                fold_metrics["train_corr"].append((fold_idx, train_metrics["pearson"]))
+                fold_metrics["train_corr"].append((fold_idx, np.abs(train_metrics["pearson"])))
                 fold_metrics["train_p"].append((fold_idx, train_metrics["pearson_p"]))
-                fold_metrics["test_corr"].append((fold_idx, test_metrics["pearson"]))
+                fold_metrics["test_corr"].append((fold_idx, np.abs(test_metrics["pearson"])))
                 fold_metrics["test_p"].append((fold_idx, test_metrics["pearson_p"]))
                 fold_metrics["train_total_loss"].append((fold_idx, train_total_loss))
                 fold_metrics["test_total_loss"].append((fold_idx, test_total_loss))
@@ -1037,7 +1037,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 bold_projection_trials= bold_projection_signal.reshape(num_trials, trial_len)
                 bold_plot_path = f"y_projection_bold_{avg_prefix}.png"
                 plot_projection_bold(bold_projection_trials, task_alpha, bold_alpha, beta_alpha, gamma_value, bold_plot_path, 
-                                     series_label="Active BOLD space (weights avg)", trial_indices=np.arange(num_trials, dtype=np.int64))
+                                     series_label="Active BOLD space (weights avg)", trial_indices_array=np.arange(num_trials, dtype=np.int64))
 
         if fold_avg_projection_series:
             for avg_series_key in sorted(fold_avg_projection_series.keys()):
