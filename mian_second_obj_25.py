@@ -108,7 +108,7 @@ trial_len = 9
 behave_indice = 1 #1/RT
 trials_per_run = num_trials // 2
 
-base_path = "/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/"
+base_path = f"/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/sub{sub}"
 brain_mask_path = f"{base_path}/sub-pd0{sub}_ses-{ses}_T1w_brain_mask.nii.gz"
 csf_mask_path = f"{base_path}/sub-pd0{sub}_ses-{ses}_T1w_brain_pve_0.nii.gz"
 gray_mask_path = f"{base_path}/sub-pd0{sub}_ses-{ses}_T1w_brain_pve_1.nii.gz"
@@ -122,23 +122,23 @@ gray_mask = nib.load(gray_mask_path).get_fdata().astype(np.float16)
 glm_dict = np.load(f"{base_path}/TYPED_FITHRF_GLMDENOISE_RR_sub{sub}.npy", allow_pickle=True).item()
 beta_glm = glm_dict["betasmd"]
 
-nan_mask_flat_run1 = np.load(f"nan_mask_flat_sub{sub}_ses{ses}_run1.npy")
-nan_mask_flat_run2 = np.load(f"nan_mask_flat_sub{sub}_ses{ses}_run2.npy")
-active_coords_run1 = np.load(f"active_coords_sub{sub}_ses{ses}_run1.npy", allow_pickle=True)
-active_coords_run2 = np.load(f"active_coords_sub{sub}_ses{ses}_run2.npy", allow_pickle=True)
+nan_mask_flat_run1 = np.load(f"sub{sub}/nan_mask_flat_sub{sub}_ses{ses}_run1.npy")
+nan_mask_flat_run2 = np.load(f"sub{sub}/nan_mask_flat_sub{sub}_ses{ses}_run2.npy")
+active_coords_run1 = np.load(f"sub{sub}/active_coords_sub{sub}_ses{ses}_run1.npy", allow_pickle=True)
+active_coords_run2 = np.load(f"sub{sub}/active_coords_sub{sub}_ses{ses}_run2.npy", allow_pickle=True)
 # Each `active_coords` array is the tuple of (x, y, z) indices saved during preprocessing for the voxels that stayed active after the statistical and Hampel filtering steps.
 
 beta_volume_filtered_run1 = np.load(f"{base_path}/cleaned_beta_volume_sub{sub}_ses{ses}_run1.npy")
 beta_volume_filtered_run2 = np.load(f"{base_path}/cleaned_beta_volume_sub{sub}_ses{ses}_run2.npy")
-beta_filtered_run1  = np.load(f"beta_volume_filter_sub{sub}_ses{ses}_run1.npy") 
-beta_filtered_run2  = np.load(f"beta_volume_filter_sub{sub}_ses{ses}_run2.npy") 
+beta_filtered_run1  = np.load(f"sub{sub}/beta_volume_filter_sub{sub}_ses{ses}_run1.npy") 
+beta_filtered_run2  = np.load(f"sub{sub}/beta_volume_filter_sub{sub}_ses{ses}_run2.npy") 
 beta_filtered_run1, beta_filtered_run2, shared_nan_mask_flat, shared_flat_indices = synchronize_beta_voxels(beta_filtered_run1, beta_filtered_run2, nan_mask_flat_run1, nan_mask_flat_run2)
 beta_clean, nan_mask_flat = combine_filtered_betas(beta_filtered_run1, beta_filtered_run2, shared_nan_mask_flat.ravel(), shared_flat_indices)
 
 bold_data_run1 = np.load(join(base_path, f'fmri_sub{sub}_ses{ses}_run1.npy'))
 bold_data_run2 = np.load(join(base_path, f'fmri_sub{sub}_ses{ses}_run2.npy'))
-clean_active_bold_run1 = np.load(f"active_bold_sub{sub}_ses{ses}_run1.npy")
-clean_active_bold_run2 = np.load(f"active_bold_sub{sub}_ses{ses}_run2.npy")
+clean_active_bold_run1 = np.load(f"sub{sub}/active_bold_sub{sub}_ses{ses}_run1.npy")
+clean_active_bold_run2 = np.load(f"sub{sub}/active_bold_sub{sub}_ses{ses}_run2.npy")
 volume_shape = bold_data_run1.shape[:3]
 active_flat_idx, active_coords, bold_clean = combine_active_run_data(active_coords_run1, active_coords_run2, clean_active_bold_run1, clean_active_bold_run2, bold_data_run1.shape[:3], shared_nan_mask_flat)
 active_coords = np.asarray(active_coords)
@@ -185,10 +185,10 @@ def apply_empca(bold_clean):
     def prepare_for_empca(data):
         W = np.isfinite(data)
         Y = np.where(np.isfinite(data), data, 0.0)
-        row_weight = W.sum(axis=0, keepdims=True)
-        mean = np.divide((Y * W).sum(axis=0, keepdims=True), row_weight, out=np.zeros_like(row_weight), where=row_weight > 0)
+        row_weight = W.sum(axis=0, keepdims=True).astype(np.float64)
+        mean = np.divide((Y * W).sum(axis=0, keepdims=True), row_weight, out=np.zeros_like(row_weight, dtype=np.float64), where=row_weight > 0)
         centered = Y - mean
-        var = np.divide((W * centered**2).sum(axis=0, keepdims=True), row_weight, out=np.zeros_like(row_weight), where=row_weight > 0)
+        var = np.divide((W * centered**2).sum(axis=0, keepdims=True), row_weight, out=np.zeros_like(row_weight, dtype=np.float64), where=row_weight > 0)
         scale = np.sqrt(var)
         z = np.divide(centered, np.maximum(scale, 1e-6), out=np.zeros_like(centered), where=row_weight > 0)
         return z, W
@@ -199,11 +199,11 @@ def apply_empca(bold_clean):
     W = W.T
     print("begin empca...", flush=True)
     m = empca(Yc, W, nvec=700, niter=15)
-    np.save(f'empca_model_sub{sub}_ses{ses}.npy', m)
+    np.save(f'sub{sub}/empca_model_sub{sub}_ses{ses}.npy', m)
     return m
 
 def load_or_fit_empca_model(bold_clean):
-    model_path = f"empca_model_sub{sub}_ses{ses}.npy"
+    model_path = f"sub{sub}/empca_model_sub{sub}_ses{ses}.npy"
     if os.path.exists(model_path):
             print(f"Loading existing EMPCA model from {model_path}", flush=True)
             return np.load(model_path, allow_pickle=True).item()
@@ -336,15 +336,46 @@ def calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smoo
     total_penalty = total_penalty + 1e-6 * np.eye(n_components)
     return {"task": task_penalty, "bold": bold_penalty, "beta": beta_penalty, "smooth": smooth_penalty}, total_penalty
 
-def _total_loss_from_penalty(weights, total_penalty, gamma_value, penalty_terms=None, label=None):
+# def _corr_ratio_and_components(run_data, weights, eps=1e-8):
+#     weights = np.asarray(weights, dtype=np.float64)
+#     beta_centered = run_data["beta_centered"]
+#     behavior_vec = run_data["normalized_behaviors"]
+#     y = beta_centered.T @ weights
+#     corr_num = float(np.dot(y, behavior_vec))
+#     corr_den = float(np.dot(y, y) + eps)
+#     corr_ratio = (corr_num ** 2) / corr_den if np.isfinite(corr_den) and corr_den > 0 else np.inf
+#     return corr_ratio, corr_num, corr_den, y
+
+# def compute_total_loss(run_data, weights, total_penalty, gamma_value, penalty_terms=None, label=None, eps=1e-8):
+#     weights = np.asarray(weights, dtype=np.float64)
+#     corr_ratio, corr_num, corr_den, _ = _corr_ratio_and_components(run_data, weights, eps=eps)
+#     penalty_value = float(weights.T @ total_penalty @ weights)
+#     if penalty_terms:
+#         label_prefix = f"[{label}] " if label else ""
+#         for term_label, matrix in penalty_terms.items():
+#             contribution = float(weights.T @ matrix @ weights)
+#             print(f"{label_prefix}{term_label}_penalty: {contribution:.6f}", flush=True)
+#     total_loss = gamma_value * penalty_value - corr_ratio
+#     return total_loss, penalty_value, corr_ratio, corr_num, corr_den
+
+def _build_objective_matrices(total_penalty, corr_num, corr_den, gamma_value, eps=1e-8):
+    A_mat = gamma_value * total_penalty - corr_num
+    A_mat = 0.5 * (A_mat + A_mat.T)
+    B_mat = 0.5 * (corr_den + corr_den.T)
+    eye = np.eye(A_mat.shape[0], dtype=np.float64)
+    return A_mat + eps * eye, B_mat + eps * eye
+
+def _total_loss_from_penalty(weights, total_penalty, gamma_value, corr_num=None, corr_den=None, penalty_terms=None, label=None, A_mat=None, B_mat=None):
     weights = np.where(np.isfinite(weights), weights, 0.0)
-    total_loss = float(weights.T @ total_penalty @ weights)
+    A_mat, B_mat = _build_objective_matrices(total_penalty, corr_num, corr_den, gamma_value)
+    numerator = float(weights.T @ A_mat @ weights)
+    denominator = float(weights.T @ B_mat @ weights)
     if penalty_terms:
         label_prefix = f"[{label}] " if label else ""
         for term_label, matrix in penalty_terms.items():
             contribution = float(weights.T @ matrix @ weights)
             print(f"{label_prefix}{term_label}_penalty: {contribution:.6f}", flush=True)
-    return gamma_value * total_loss
+    return numerator / denominator
 
 def evaluate_projection_corr(data, weights):
     #corr(W*beta, behave)
@@ -543,12 +574,7 @@ def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth
     penalty_matrices, total_penalty = calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth)
 
     corr_num, corr_den = run_data["C_corr_num"], run_data["C_corr_den"]
-    A_mat = gamma * total_penalty - corr_num
-    A_mat = 0.5 * (A_mat + A_mat.T)
-    B_mat = 0.5 * (corr_den + corr_den.T)
-    eye = np.eye(n_components, dtype=np.float64)
-    A_mat = A_mat + 1e-8 * eye
-    B_mat = B_mat + 1e-8 * eye
+    A_mat, B_mat = _build_objective_matrices(total_penalty, corr_num, corr_den, gamma)
 
     def _objective_with_grad(weights):
         numerator = weights.T @ A_mat @ weights
@@ -578,10 +604,10 @@ def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth
 
     contributions = {label: solution_weights.T @ matrix @ solution_weights for label, matrix in penalty_matrices.items()}
     y = beta_centered.T @ solution_weights
-    total_loss = _total_loss_from_penalty(solution_weights, total_penalty, gamma)
     numerator_value = solution_weights.T @ A_mat @ solution_weights
-    fractional_objective = numerator_value / denominator_value
     correlation_numerator = solution_weights.T @ corr_num @ solution_weights
+    total_loss = _total_loss_from_penalty(solution_weights, total_penalty, gamma, corr_num=corr_num, corr_den=corr_den, A_mat=A_mat, B_mat=B_mat)
+    fractional_objective = numerator_value / denominator_value
     correlation_ratio = correlation_numerator / denominator_value
 
     return {"weights": solution_weights, "total_loss": total_loss, "Y": y, "fractional_objective": fractional_objective,
@@ -864,11 +890,11 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
 # # %%
 ridge_penalty = 1e-6
 solver_name = "MOSEK"
-penalty_sweep = [(0.5, 0.7, 0.25, 0.8), (0, 0.7, 0.25, 0.8), (0.5, 0, 0.25, 0.8), (0.5, 0.7, 0, 0.8), (0.5, 0.7, 0.25, 0)]
-# penalty_sweep = [(0.5, 0.7, 0.25, 0.8)]
+# penalty_sweep = [(0.5, 0.7, 0.25, 0.8), (0, 0.7, 0.25, 0.8), (0.5, 0, 0.25, 0.8), (0.5, 0.7, 0, 0.8), (0.5, 0.7, 0.25, 0)]
+penalty_sweep = [(0.5, 0.7, 0.25, 0.8)]
 alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha, "smooth_penalty": smooth_alpha} for task_alpha, bold_alpha, beta_alpha, smooth_alpha in penalty_sweep]
-gamma_sweep = [0, 0.2, 0.8]
-# gamma_sweep = [0, 0.2]
+# gamma_sweep = [0, 0.2, 0.8]
+gamma_sweep = [0.2]
 SAVE_PER_FOLD_VOXEL_MAPS = False  # disable individual fold voxel-weight plots; averages saved later
 
 projection_data = build_pca_dataset(bold_clean, beta_clean, behavior_matrix, nan_mask_flat, active_coords, active_flat_idx, trial_len, num_trials)
@@ -917,7 +943,8 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                                f"C_beta: {penalty_contributions.get('beta')}, " f"C_smooth: {penalty_contributions.get('smooth')}")
                 print(f"  Loss terms -> {loss_report}", flush=True)
 
-                component_weights = np.abs(solution["weights"])
+                # Preserve the optimized weight signs so correlation metrics match the optimized objective
+                component_weights = np.asarray(solution["weights"], dtype=np.float64)
                 coeff_pinv = np.asarray(train_data["coeff_pinv"])
                 voxel_weights = coeff_pinv.T @ component_weights
                 if SAVE_PER_FOLD_VOXEL_MAPS:
@@ -939,10 +966,9 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 test_metrics = evaluate_projection_corr(test_data, component_weights)
 
                 train_total_loss = solution.get("total_loss")
-                # train_penalties, train_total_penalty = calcu_penalty_terms(train_data, task_alpha, bold_alpha, beta_alpha, smooth_alpha)
-                # computed_train_loss = _total_loss_from_penalty(solution["weights"], train_total_penalty, gamma_value, penalty_terms=train_penalties, label="train")
                 test_penalties, total_penalty = calcu_penalty_terms(test_data, task_alpha, bold_alpha, beta_alpha, smooth_alpha)
-                test_total_loss = _total_loss_from_penalty(solution["weights"], total_penalty, gamma_value, penalty_terms=test_penalties, label="test")
+                test_total_loss = _total_loss_from_penalty(solution["weights"], total_penalty, gamma_value, corr_num=test_data["C_corr_num"], 
+                                                           corr_den=test_data["C_corr_den"], penalty_terms=test_penalties, label="test")
                 train_metrics["total_loss"] = train_total_loss
                 test_metrics["total_loss"] = test_total_loss
 
@@ -969,7 +995,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 fold_metrics["test_total_loss"].append((fold_idx, test_total_loss))
 
     if fold_metric_records:
-        print("\n===== Saving fold-wise metric bar plots =====", flush=True)
+        print("\n===== Saving fold-wise metric box plots =====", flush=True)
         for metrics_key in sorted(fold_metric_records.keys()):
             task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value = metrics_key
             combo_label = (f"task={task_alpha:g}, bold={bold_alpha:g}, beta={beta_alpha:g}, smooth={smooth_alpha:g}, gamma={gamma_value:g}")

@@ -9,7 +9,7 @@ import scipy.ndimage as ndimage
 from empca.empca.empca import empca
 
 # %%
-ses = 2
+ses = 1
 sub = '09'
 run = 1
 num_trials = 90
