@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=fmri_opt
 #SBATCH --account=st-mmckeown-1
-#SBATCH --time=12:00:00
+#SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

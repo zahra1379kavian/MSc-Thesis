@@ -2,7 +2,7 @@
 #SBATCH --job-name=fmri_bigmem
 #SBATCH --array=0-11
 #SBATCH --account=st-mmckeown-1
-#SBATCH --time=36:00:00
+#SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8

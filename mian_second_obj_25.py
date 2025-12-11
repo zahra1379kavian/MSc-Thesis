@@ -1,7 +1,10 @@
 # Combine Run 1 & 2
 import argparse
+import json
+import math
 import os
 from collections import defaultdict
+from datetime import datetime
 from os.path import join
 from empca.empca.empca import empca
 import matplotlib
@@ -18,6 +21,57 @@ from scipy.optimize import minimize
 from scipy.spatial import cKDTree
 from scipy.stats import t as student_t
 import pingouin as pg
+
+LOG_FILE = "run_metrics_log.jsonl"
+
+
+def _array_summary(array):
+    flat = np.asarray(array, dtype=np.float64).ravel()
+    finite = flat[np.isfinite(flat)]
+    if finite.size == 0:
+        return {"min": np.nan, "max": np.nan, "mean": np.nan, "var": np.nan}
+    return {
+        "min": float(np.min(finite)),
+        "max": float(np.max(finite)),
+        "mean": float(np.mean(finite)),
+        "var": float(np.var(finite)),
+    }
+
+
+def _matrix_norm_summary(matrix):
+    mat = np.asarray(matrix, dtype=np.float64)
+    finite = np.isfinite(mat)
+    if not finite.any():
+        return {"fro": np.nan, "mean_abs": np.nan, "max_abs": np.nan}
+    safe_mat = np.where(finite, mat, 0.0)
+    fro_norm = float(np.linalg.norm(safe_mat, ord="fro"))
+    abs_vals = np.abs(safe_mat[finite])
+    return {"fro": fro_norm, "mean_abs": float(np.mean(abs_vals)), "max_abs": float(np.max(abs_vals))}
+
+
+def _sanitize_for_json(obj):
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    if isinstance(obj, (np.floating, np.integer, float, int)):
+        value = float(obj)
+        if not math.isfinite(value):
+            return None
+        return value
+    if isinstance(obj, str) or obj is None:
+        return obj
+    return str(obj)
+
+
+def _append_run_log(entry, path=LOG_FILE):
+    payload = dict(entry)
+    payload["timestamp"] = datetime.utcnow().isoformat() + "Z"
+    payload = _sanitize_for_json(payload)
+    with open(path, "a") as log_file:
+        log_file.write(json.dumps(payload) + "\n")
 
 
 def synchronize_beta_voxels(beta_run1, beta_run2, mask_run1, mask_run2):
@@ -102,7 +156,7 @@ def compute_distance_weighted_adjacency(coords, affine, radius_mm=3.0, sigma_mm=
     return adjacency, degree_matrix
 # %% 
 ses = 1
-sub = "04"
+sub = "09"
 num_trials = 180
 trial_len = 9
 behave_indice = 1 #1/RT
@@ -181,6 +235,29 @@ def standardize_matrix(matrix):
     normalized_mat = sym_array / trace_value * sym_array.shape[0]
     return normalized_mat
 
+def select_empca_components(model, variance_threshold=0.8):
+    explained = np.var(model.coeff, axis=0)
+    total = explained.sum()
+    if not np.isfinite(total) or total <= 0:
+        print("EMPCA variance check failed; keeping all components.", flush=True)
+        return model
+
+    explained_ratio = explained / total
+    cumulative_ratio = np.cumsum(explained_ratio)
+    for idx, (var, frac, cum_frac) in enumerate(zip(explained, explained_ratio, cumulative_ratio), start=1):
+        print(f"EMPCA component {idx:3d}: variance={var:.6f}, ratio={frac*100:.2f}%, cumulative={cum_frac*100:.2f}%", flush=True)
+
+    target_components = int(np.searchsorted(cumulative_ratio, variance_threshold) + 1)
+    target_components = min(target_components, model.nvec)
+    print(f"Using {target_components} EMPCA components for {variance_threshold*100:.0f}% variance.", flush=True)
+
+    model.nvec = target_components
+    model.eigvec = model.eigvec[:target_components]
+    model.coeff = model.coeff[:, :target_components]
+    model.solve_model()
+    model.dof = model.data[model._unmasked].size - model.eigvec.size - model.nvec * model.nobs
+    return model
+
 def apply_empca(bold_clean):
     def prepare_for_empca(data):
         W = np.isfinite(data)
@@ -198,30 +275,94 @@ def apply_empca(bold_clean):
     Yc = Yc.T
     W = W.T
     print("begin empca...", flush=True)
-    m = empca(Yc, W, nvec=700, niter=15)
+    m = empca(Yc, W, nvec=250, niter=30)
     np.save(f'sub{sub}/empca_model_sub{sub}_ses{ses}.npy', m)
     return m
 
 def load_or_fit_empca_model(bold_clean):
     model_path = f"sub{sub}/empca_model_sub{sub}_ses{ses}.npy"
     if os.path.exists(model_path):
-            print(f"Loading existing EMPCA model from {model_path}", flush=True)
-            return np.load(model_path, allow_pickle=True).item()
+        print(f"Loading existing EMPCA model from {model_path}", flush=True)
+        m = np.load(model_path, allow_pickle=True).item()
+        m = select_empca_components(m, variance_threshold=0.80)
+        return m
     return apply_empca(bold_clean)
 
 def build_pca_dataset(bold_clean, beta_clean, behavioral_matrix, nan_mask_flat, active_coords, active_flat_indices, trial_length, num_trials):
     pca_model = load_or_fit_empca_model(bold_clean)
     bold_pca_components = pca_model.eigvec
-    if bold_pca_components.shape[1] != num_trials * trial_length:
-        raise ValueError(f"PCA components ({bold_pca_components.shape[1]}) do not match expected trial length ({expected_points}).")
     bold_pca_trials = bold_pca_components.reshape(bold_pca_components.shape[0], num_trials, trial_length)
     
     coeff_pinv = np.linalg.pinv(pca_model.coeff)
     beta_pca_full = coeff_pinv @ np.nan_to_num(beta_clean)
 
+    normalization = _compute_global_normalization(behavioral_matrix, beta_pca_full, behave_indice)
+
     return {"pca_model": pca_model, "bold_pca_trials": bold_pca_trials, "coeff_pinv": coeff_pinv, "beta_pca_full": beta_pca_full, 
             "bold_clean": bold_clean, "beta_clean": beta_clean, "behavior_matrix": behavioral_matrix, "nan_mask_flat": nan_mask_flat, 
-            "active_coords": active_coords, "active_flat_indices": active_flat_indices}
+            "active_coords": active_coords, "active_flat_indices": active_flat_indices, **normalization}
+
+def _compute_global_normalization(behavior_matrix, beta_pca_full, behavior_index):
+    behavior_vector = behavior_matrix[:, behavior_index].ravel()
+    behavior_finite_mask = np.isfinite(behavior_vector)
+
+    behavior_centered_full = np.full_like(behavior_vector, np.nan, dtype=np.float64)
+    behavior_mean = float(np.nanmean(behavior_vector[behavior_finite_mask]))
+    behavior_centered_full[behavior_finite_mask] = behavior_vector[behavior_finite_mask] - behavior_mean
+    behavior_norm = float(np.linalg.norm(behavior_centered_full[behavior_finite_mask]))
+    if not np.isfinite(behavior_norm) or behavior_norm <= 0:
+        behavior_norm = 1.0
+
+    behavior_normalized_full = np.full_like(behavior_vector, np.nan, dtype=np.float64)
+    behavior_normalized_full[behavior_finite_mask] = behavior_centered_full[behavior_finite_mask] / behavior_norm
+
+    behavior_mask = behavior_finite_mask[None, :]
+    beta_valid_mask = np.isfinite(beta_pca_full) & behavior_mask
+    beta_counts = beta_valid_mask.sum(axis=1, keepdims=True)
+    beta_sum = np.nansum(np.where(beta_valid_mask, beta_pca_full, 0.0), axis=1, keepdims=True)
+    beta_mean = np.divide(beta_sum, beta_counts, out=np.zeros_like(beta_sum, dtype=np.float64), where=beta_counts > 0)
+    beta_centered_full = beta_pca_full - beta_mean
+
+    return {"behavior_vector_full": behavior_vector, "behavior_centered_full": behavior_centered_full,
+            "behavior_normalized_full": behavior_normalized_full, "behavior_mean": behavior_mean,
+            "behavior_norm": behavior_norm, "beta_centered_full": beta_centered_full, "beta_mean_full": beta_mean}
+
+def compute_fold_normalization(projection_data, train_indices, behavior_index):
+    """Center/scale behaviors (and beta means) using only the training trials, then apply the scale to all trials."""
+    behavior_vector_full = projection_data["behavior_vector_full"]
+    beta_pca_full = projection_data["beta_pca_full"]
+
+    total_trials = behavior_vector_full.size
+    train_mask = np.zeros(total_trials, dtype=bool)
+    train_mask[np.asarray(train_indices, dtype=int)] = True
+    behavior_mask = np.isfinite(behavior_vector_full)
+    behavior_train_mask = train_mask & behavior_mask
+
+    behavior_mean = float(np.nanmean(behavior_vector_full[behavior_train_mask])) if np.any(behavior_train_mask) else 0.0
+    behavior_centered_full = np.full_like(behavior_vector_full, np.nan, dtype=np.float64)
+    behavior_centered_full[behavior_mask] = behavior_vector_full[behavior_mask] - behavior_mean
+    behavior_norm = float(np.linalg.norm(behavior_centered_full[behavior_train_mask])) if np.any(behavior_train_mask) else 1.0
+    if not np.isfinite(behavior_norm) or behavior_norm <= 0:
+        behavior_norm = 1.0
+
+    behavior_normalized_full = np.full_like(behavior_vector_full, np.nan, dtype=np.float64)
+    behavior_normalized_full[behavior_mask] = behavior_centered_full[behavior_mask] / behavior_norm
+
+    beta_valid_train = np.isfinite(beta_pca_full) & behavior_train_mask[None, :]
+    beta_counts = beta_valid_train.sum(axis=1, keepdims=True)
+    beta_sum = np.nansum(np.where(beta_valid_train, beta_pca_full, 0.0), axis=1, keepdims=True)
+    beta_mean = np.divide(beta_sum, beta_counts, out=np.zeros_like(beta_sum, dtype=np.float64), where=beta_counts > 0)
+    beta_centered_full = beta_pca_full - beta_mean
+
+    return {
+        "behavior_vector_full": behavior_vector_full,
+        "behavior_centered_full": behavior_centered_full,
+        "behavior_normalized_full": behavior_normalized_full,
+        "behavior_mean": behavior_mean,
+        "behavior_norm": behavior_norm,
+        "beta_centered_full": beta_centered_full,
+        "beta_mean_full": beta_mean,
+    }
 
 def build_loss_corr_term(beta_components, normalized_behaviors, ridge=1e-6):
     beta_components = np.nan_to_num(beta_components, nan=0.0, posinf=0.0, neginf=0.0)
@@ -331,6 +472,7 @@ def calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smoo
     bold_penalty = alpha_bold * run_data["C_bold"]
     beta_penalty = alpha_beta * run_data["C_beta"]
     smooth_penalty = alpha_smooth * run_data.get("C_smooth")
+
     total_penalty = task_penalty + bold_penalty + beta_penalty + smooth_penalty
     total_penalty = 0.5 * (total_penalty + total_penalty.T)
     total_penalty = total_penalty + 1e-6 * np.eye(n_components)
@@ -527,32 +669,45 @@ def calcu_matrices_func(beta_pca, bold_pca, behave_mat, behave_indice, trial_len
 
     return C_task, C_bold, C_beta, behavior_selected
 
-def prepare_data_func(projection_data, trial_indices, trial_length, run_boundary):
+def prepare_data_func(projection_data, trial_indices, trial_length, run_boundary, normalization_info):
     effective_num_trials = trial_indices.size
     behavior_subset = projection_data["behavior_matrix"][trial_indices]
+    behavior_vector_full = normalization_info["behavior_vector_full"]
+    behavior_centered_full_all = normalization_info["behavior_centered_full"]
+    behavior_normalized_full_all = normalization_info["behavior_normalized_full"]
+    beta_centered_full_all = normalization_info["beta_centered_full"]
     beta_pca_full = projection_data["beta_pca_full"]
+
+    behavior_vector = behavior_vector_full[trial_indices]
+    behavior_centered_full = behavior_centered_full_all[trial_indices]
+    behavior_normalized_full = behavior_normalized_full_all[trial_indices]
+    beta_centered_full = beta_centered_full_all
     beta_pca = beta_pca_full[:, trial_indices]
+    beta_centered_subset = beta_centered_full[:, trial_indices]
     bold_pca_trials = projection_data["bold_pca_trials"][:, trial_indices, :]
     bold_pca_components = bold_pca_trials.reshape(bold_pca_trials.shape[0], effective_num_trials * trial_length)
 
-    (C_task, C_bold, C_beta, behavior_vector) = calcu_matrices_func(beta_pca, bold_pca_components, behavior_subset, behave_indice,
-                                                                    trial_len=trial_length, num_trials=effective_num_trials,
-                                                                    trial_indices=trial_indices, run_boundary=run_boundary)
+    (C_task, C_bold, C_beta, _) = calcu_matrices_func(beta_pca, bold_pca_components, behavior_subset, behave_indice,
+                                                      trial_len=trial_length, num_trials=effective_num_trials,
+                                                      trial_indices=trial_indices, run_boundary=run_boundary)
     C_task, C_bold, C_beta = standardize_matrix(C_task), standardize_matrix(C_bold), standardize_matrix(C_beta)
     
     trial_mask = np.isfinite(behavior_vector)
     behavior_observed = behavior_vector[trial_mask]
-    behavior_mean = np.mean(behavior_observed)
-    behavior_centered = behavior_observed - behavior_mean
-    behavior_norm = np.linalg.norm(behavior_centered)
-    if not np.isfinite(behavior_norm) or behavior_norm <= 0:
-        print("behavior_norm is zero or non-finite; using 1.0 to avoid division errors.", flush=True)
-        behavior_norm = 1.0
-    normalized_behaviors = behavior_centered / behavior_norm
+    behavior_centered = behavior_centered_full[trial_mask]
+    normalized_behaviors = behavior_normalized_full[trial_mask]
 
     beta_observed = beta_pca[:, trial_mask]
-    beta_centered = beta_observed - np.mean(beta_observed, axis=1, keepdims=True)
+    beta_centered = beta_centered_subset[:, trial_mask]
+    # Correlation term (r^2) — keep the ratio intact, but rescale both matrices by a shared scalar
+    # so their magnitude is comparable to the (standardized) penalty matrices. Using a common scale
+    # preserves w^T C_corr_num w / w^T C_corr_den w while preventing tiny denominators.
     C_corr_num, C_corr_den = build_loss_corr_term(beta_centered, normalized_behaviors)
+    corr_scale = float(np.trace(C_corr_den)) / max(1, C_corr_den.shape[0])
+    if not np.isfinite(corr_scale) or corr_scale <= 0:
+        corr_scale = 1.0
+    C_corr_num = C_corr_num / corr_scale
+    C_corr_den = C_corr_den / corr_scale
 
     beta_subset = projection_data["beta_clean"][:, trial_indices]
     bold_subset = projection_data["bold_clean"][:, trial_indices, :]
@@ -888,13 +1043,14 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
     return y_projection_voxel
 
 # # %%
-ridge_penalty = 1e-6
+ridge_penalty = 1e-3
 solver_name = "MOSEK"
-# penalty_sweep = [(0.5, 0.7, 0.25, 0.8), (0, 0.7, 0.25, 0.8), (0.5, 0, 0.25, 0.8), (0.5, 0.7, 0, 0.8), (0.5, 0.7, 0.25, 0)]
-penalty_sweep = [(0.5, 0.7, 0.25, 0.8)]
+# penalty_sweep = [(0.8, 1, 0.5, 1.2), (0, 1, 0.5, 1.2), (0.8, 0, 0.5, 1.2), (0.8, 1, 0, 1.2), (0.8, 1, 0.5, 0)]
+# penalty_sweep = [(0.5, 0.7, 0.25, 0.8)]
+penalty_sweep = [(0.8, 1, 0.5, 1.2)]
 alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha, "smooth_penalty": smooth_alpha} for task_alpha, bold_alpha, beta_alpha, smooth_alpha in penalty_sweep]
 # gamma_sweep = [0, 0.2, 0.8]
-gamma_sweep = [0.2]
+gamma_sweep = [2]
 SAVE_PER_FOLD_VOXEL_MAPS = False  # disable individual fold voxel-weight plots; averages saved later
 
 projection_data = build_pca_dataset(bold_clean, beta_clean, behavior_matrix, nan_mask_flat, active_coords, active_flat_idx, trial_len, num_trials)
@@ -917,8 +1073,14 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
         run1_desc = (int(split["test_run1"][0] + 1), int(split["test_run1"][-1] + 1))
         run2_desc = (int(split["test_run2"][0] + 1), int(split["test_run2"][-1] + 1))
         print(f"Test trials (1-based): run1 {run1_desc[0]}-{run1_desc[1]}, run2 {run2_desc[0]}-{run2_desc[1]}", flush=True)
-        train_data = prepare_data_func(projection_data, train_indices, trial_len, trials_per_run)
-        test_data = prepare_data_func(projection_data, test_indices, trial_len, trials_per_run)
+        normalization_info = compute_fold_normalization(projection_data, train_indices, behave_indice)
+        train_data = prepare_data_func(projection_data, train_indices, trial_len, trials_per_run, normalization_info)
+        test_data = prepare_data_func(projection_data, test_indices, trial_len, trials_per_run, normalization_info)
+
+        train_corr_norms = {"num": _matrix_norm_summary(train_data["C_corr_num"]), "den": _matrix_norm_summary(train_data["C_corr_den"])}
+        test_corr_norms = {"num": _matrix_norm_summary(test_data["C_corr_num"]), "den": _matrix_norm_summary(test_data["C_corr_den"])}
+        print(f"  Corr matrix norms (train) num_fro={train_corr_norms['num']['fro']:.4f}, den_fro={train_corr_norms['den']['fro']:.4f}; "
+            f"(test) num_fro={test_corr_norms['num']['fro']:.4f}, den_fro={test_corr_norms['den']['fro']:.4f}", flush=True)
 
         for alpha_setting in alpha_settings:
             task_alpha, bold_alpha, beta_alpha, smooth_alpha = alpha_setting["task_penalty"], alpha_setting["bold_penalty"], alpha_setting["beta_penalty"], alpha_setting["smooth_penalty"]
@@ -965,10 +1127,25 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 train_metrics = evaluate_projection_corr(train_data, component_weights)
                 test_metrics = evaluate_projection_corr(test_data, component_weights)
 
+                train_penalties, total_penalty_train = calcu_penalty_terms(train_data, task_alpha, bold_alpha, beta_alpha, smooth_alpha)
+                train_A, train_B = _build_objective_matrices(total_penalty_train, train_data["C_corr_num"], train_data["C_corr_den"], gamma_value)
                 train_total_loss = solution.get("total_loss")
-                test_penalties, total_penalty = calcu_penalty_terms(test_data, task_alpha, bold_alpha, beta_alpha, smooth_alpha)
-                test_total_loss = _total_loss_from_penalty(solution["weights"], total_penalty, gamma_value, corr_num=test_data["C_corr_num"], 
+                train_numerator = float(component_weights.T @ train_A @ component_weights)
+                train_denominator = float(component_weights.T @ train_B @ component_weights)
+                train_corr_num_quad = float(component_weights.T @ train_data["C_corr_num"] @ component_weights)
+                train_gamma_penalty = float(gamma_value * (component_weights.T @ total_penalty_train @ component_weights))
+                train_corr_ratio = train_corr_num_quad / train_denominator if np.isfinite(train_denominator) and train_denominator > 0 else np.nan
+
+                test_penalties, total_penalty_test = calcu_penalty_terms(test_data, task_alpha, bold_alpha, beta_alpha, smooth_alpha)
+                test_total_loss = _total_loss_from_penalty(solution["weights"], total_penalty_test, gamma_value, corr_num=test_data["C_corr_num"], 
                                                            corr_den=test_data["C_corr_den"], penalty_terms=test_penalties, label="test")
+                test_A, test_B = _build_objective_matrices(total_penalty_test, test_data["C_corr_num"], test_data["C_corr_den"], gamma_value)
+                test_numerator = float(component_weights.T @ test_A @ component_weights)
+                test_denominator = float(component_weights.T @ test_B @ component_weights)
+                test_corr_num_quad = float(component_weights.T @ test_data["C_corr_num"] @ component_weights)
+                test_gamma_penalty = float(gamma_value * (component_weights.T @ total_penalty_test @ component_weights))
+                test_corr_ratio = test_corr_num_quad / test_denominator if np.isfinite(test_denominator) and test_denominator > 0 else np.nan
+
                 train_metrics["total_loss"] = train_total_loss
                 test_metrics["total_loss"] = test_total_loss
 
@@ -976,6 +1153,41 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 print(f"  Total loss (test objective):  {test_total_loss:.6f}", flush=True)
                 print(f"  Train metrics -> corr: {train_metrics['pearson']:.4f}", flush=True)
                 print(f"  Test metrics  -> corr: {test_metrics['pearson']:.4f},", flush=True)
+
+                input_stats = {"beta_clean": _array_summary(train_data["beta_clean"]),
+                    "active_bold": _array_summary(train_data["active_bold"]),
+                    "behavior_observed": _array_summary(train_data["behavior_observed"]),
+                    "beta_centered": _array_summary(train_data["beta_centered"]),
+                    "normalized_behaviors": _array_summary(train_data["normalized_behaviors"])}
+                weight_stats = {"component_weights": _array_summary(component_weights), "voxel_weights": _array_summary(voxel_weights)}
+                log_entry = {"fold": fold_idx,
+                    "run1_test_span": run1_desc,
+                    "run2_test_span": run2_desc,
+                    "alphas": {"task": task_alpha, "bold": bold_alpha, "beta": beta_alpha, "smooth": smooth_alpha},
+                    "gamma": gamma_value,
+                    "numerator": numerator_value,
+                    "denominator": denominator_value,
+                    "fractional_objective": solution.get("fractional_objective"),
+                    "train_total_loss": train_total_loss,
+                    "test_total_loss": test_total_loss,
+                    "train_corr": float(train_metrics.get("pearson", np.nan)),
+                    "test_corr": float(test_metrics.get("pearson", np.nan)),
+                    "train_numerator": train_numerator,
+                    "train_denominator": train_denominator,
+                    "train_corr_ratio": train_corr_ratio,
+                    "test_numerator": test_numerator,
+                    "test_denominator": test_denominator,
+                    "test_corr_ratio": test_corr_ratio,
+                    "train_gamma_penalty": train_gamma_penalty,
+                    "test_gamma_penalty": test_gamma_penalty,
+                    "train_corr_num_quad": train_corr_num_quad,
+                    "test_corr_num_quad": test_corr_num_quad,
+                    "penalty_contributions": {k: float(v) for k, v in penalty_contributions.items()},
+                    "train_corr_norms": train_corr_norms,
+                    "test_corr_norms": test_corr_norms,
+                    "input_stats": input_stats,
+                    "weight_stats": weight_stats}
+                _append_run_log(log_entry)
 
                 metrics_key = (task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value)
                 bucket = aggregate_metrics[metrics_key]
