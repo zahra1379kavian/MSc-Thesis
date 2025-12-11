@@ -370,6 +370,16 @@ def build_loss_corr_term(beta_components, normalized_behaviors, ridge=1e-6):
     behavior_projection = beta_components @ behavior_vector.T
     C_b = behavior_projection @ behavior_projection.T
     C_d = beta_components @ beta_components.T
+    skew_b = C_b - C_b.T
+    skew_d = C_d - C_d.T
+    print(
+        f"C_b symmetry deviation: fro_norm={np.linalg.norm(skew_b, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_b)):.6e}",
+        flush=True,
+    )
+    print(
+        f"C_d symmetry deviation: fro_norm={np.linalg.norm(skew_d, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_d)):.6e}",
+        flush=True,
+    )
     C_b = 0.5 * (C_b + C_b.T)
     C_d = 0.5 * (C_d + C_d.T)
     eye = np.eye(beta_components.shape[0])
@@ -471,7 +481,10 @@ def calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smoo
     task_penalty = alpha_task * run_data["C_task"]
     bold_penalty = alpha_bold * run_data["C_bold"]
     beta_penalty = alpha_beta * run_data["C_beta"]
-    smooth_penalty = alpha_smooth * run_data.get("C_smooth")
+    smooth_matrix = run_data.get("C_smooth")
+    skew_smooth = smooth_matrix - smooth_matrix.T
+    print(f"C_smooth symmetry deviation: fro_norm={np.linalg.norm(skew_smooth, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_smooth)):.6e}",flush=True)
+    smooth_penalty = alpha_smooth * smooth_matrix
 
     total_penalty = task_penalty + bold_penalty + beta_penalty + smooth_penalty
     total_penalty = 0.5 * (total_penalty + total_penalty.T)
@@ -690,6 +703,12 @@ def prepare_data_func(projection_data, trial_indices, trial_length, run_boundary
     (C_task, C_bold, C_beta, _) = calcu_matrices_func(beta_pca, bold_pca_components, behavior_subset, behave_indice,
                                                       trial_len=trial_length, num_trials=effective_num_trials,
                                                       trial_indices=trial_indices, run_boundary=run_boundary)
+    skew_task = C_task - C_task.T
+    skew_bold = C_bold - C_bold.T
+    skew_beta = C_beta - C_beta.T
+    print(f"C_task symmetry deviation: fro_norm={np.linalg.norm(skew_task, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_task)):.6e}",flush=True)
+    print(f"C_bold symmetry deviation: fro_norm={np.linalg.norm(skew_bold, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_bold)):.6e}",flush=True)
+    print(f"C_beta symmetry deviation: fro_norm={np.linalg.norm(skew_beta, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_beta)):.6e}",flush=True)
     C_task, C_bold, C_beta = standardize_matrix(C_task), standardize_matrix(C_bold), standardize_matrix(C_beta)
     
     trial_mask = np.isfinite(behavior_vector)
@@ -1063,7 +1082,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
     bold_pca_components = projection_data["pca_model"].eigvec
     aggregate_metrics = defaultdict(lambda: {"train_corr": [], "train_p": [], "test_corr": [], "test_p": [], "train_total_loss": [], "test_total_loss": []})
     fold_metric_records = defaultdict(lambda: defaultdict(list))
-    fold_output_tracker = defaultdict(lambda: {"voxel_weights": [], "bold_corr": [], "beta_corr": []})
+    fold_output_tracker = defaultdict(lambda: {"component_weights": [], "voxel_weights": [], "bold_corr": [], "beta_corr": []})
     metric_plot_configs = {"train_corr": {"title": "Train correlation", "ylabel": "Corr"}, "test_corr": {"title": "Test correlation", "ylabel": "Corr"},
                            "train_p": {"title": "Train correlation p-value", "ylabel": "p-value", "threshold": 0.05},
                            "test_p": {"title": "Test correlation p-value", "ylabel": "p-value", "threshold": 0.05}}
@@ -1120,6 +1139,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                                                              voxel_weights=voxel_weights, beta_clean=train_data["beta_clean"],
                                                              data=train_data, bold_projection=projection_signal, plot_trials=False) 
                 fold_outputs = fold_output_tracker[metrics_key]
+                fold_outputs["component_weights"].append(np.abs(component_weights))
                 fold_outputs["voxel_weights"].append(np.abs(voxel_weights))
                 fold_outputs["bold_corr"].append(np.abs(voxel_correlations))
                 fold_outputs["beta_corr"].append(np.abs(beta_voxel_correlations))
@@ -1242,6 +1262,10 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
             task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value = metrics_key
             fold_outputs = fold_output_tracker[metrics_key]
             avg_prefix = f"foldavg_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_smooth{smooth_alpha:g}_gamma{gamma_value:g}"
+
+            comp_weights_stack = np.stack(fold_outputs["component_weights"], axis=0)
+            comp_weights_icc = _compute_matrix_icc(comp_weights_stack)
+            print(f"  ICC (component weights across folds/components): {comp_weights_icc:.4f}" if np.isfinite(comp_weights_icc) else "  ICC (component weights) could not be computed", flush=True)
 
             weights_stack = np.stack(fold_outputs["voxel_weights"], axis=0)
             weights_avg = np.nanmean(weights_stack, axis=0)
