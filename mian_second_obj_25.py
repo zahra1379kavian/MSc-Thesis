@@ -17,6 +17,7 @@ import pandas as pd
 from nilearn import plotting
 from scipy import sparse
 from scipy.io import loadmat
+from scipy.linalg import eigh
 from scipy.optimize import minimize
 from scipy.spatial import cKDTree
 from scipy.stats import t as student_t
@@ -155,7 +156,7 @@ def compute_distance_weighted_adjacency(coords, affine, radius_mm=3.0, sigma_mm=
     degree_matrix = sparse.diags(degrees).tocsr()  # CSR keeps diagonal structure but allows slicing.
     return adjacency, degree_matrix
 # %% 
-ses = 1
+ses = 2
 sub = "09"
 num_trials = 180
 trial_len = 9
@@ -173,7 +174,7 @@ brain_mask = nib.load(brain_mask_path).get_fdata().astype(np.float16)
 csf_mask = nib.load(csf_mask_path).get_fdata().astype(np.float16)
 gray_mask = nib.load(gray_mask_path).get_fdata().astype(np.float16)
 
-glm_dict = np.load(f"{base_path}/TYPED_FITHRF_GLMDENOISE_RR_sub{sub}.npy", allow_pickle=True).item()
+glm_dict = np.load(f"{base_path}/TYPED_FITHRF_GLMDENOISE_RR_sub{sub}_ses{ses}.npy", allow_pickle=True).item()
 beta_glm = glm_dict["betasmd"]
 
 nan_mask_flat_run1 = np.load(f"sub{sub}/nan_mask_flat_sub{sub}_ses{ses}_run1.npy")
@@ -244,8 +245,8 @@ def select_empca_components(model, variance_threshold=0.8):
 
     explained_ratio = explained / total
     cumulative_ratio = np.cumsum(explained_ratio)
-    for idx, (var, frac, cum_frac) in enumerate(zip(explained, explained_ratio, cumulative_ratio), start=1):
-        print(f"EMPCA component {idx:3d}: variance={var:.6f}, ratio={frac*100:.2f}%, cumulative={cum_frac*100:.2f}%", flush=True)
+    # for idx, (var, frac, cum_frac) in enumerate(zip(explained, explained_ratio, cumulative_ratio), start=1):
+    #     print(f"EMPCA component {idx:3d}: variance={var:.6f}, ratio={frac*100:.2f}%, cumulative={cum_frac*100:.2f}%", flush=True)
 
     target_components = int(np.searchsorted(cumulative_ratio, variance_threshold) + 1)
     target_components = min(target_components, model.nvec)
@@ -303,12 +304,12 @@ def build_pca_dataset(bold_clean, beta_clean, behavioral_matrix, nan_mask_flat, 
             "active_coords": active_coords, "active_flat_indices": active_flat_indices, **normalization}
 
 def _compute_global_normalization(behavior_matrix, beta_pca_full, behavior_index):
-    # behavior_vector = behavior_matrix[:, behavior_index].ravel()
-    raw_behavior = behavior_matrix[:, behavior_index].ravel()
-    inv_behavior = np.divide(1.0, raw_behavior, out=np.full_like(raw_behavior, np.nan, dtype=np.float64),
-                             where=np.isfinite(raw_behavior) & (raw_behavior != 0))
-    inv_max = np.nanmax(inv_behavior) if np.any(np.isfinite(inv_behavior)) else 0.0
-    behavior_vector = inv_behavior - inv_max
+    behavior_vector = behavior_matrix[:, behavior_index].ravel()
+    # raw_behavior = behavior_matrix[:, behavior_index].ravel()
+    # inv_behavior = np.divide(1.0, raw_behavior, out=np.full_like(raw_behavior, np.nan, dtype=np.float64),
+    #                          where=np.isfinite(raw_behavior) & (raw_behavior != 0))
+    # inv_max = np.nanmax(inv_behavior) if np.any(np.isfinite(inv_behavior)) else 0.0
+    # behavior_vector = inv_behavior - inv_max
     behavior_finite_mask = np.isfinite(behavior_vector)
 
     behavior_centered_full = np.full_like(behavior_vector, np.nan, dtype=np.float64)
@@ -434,7 +435,8 @@ def _compute_matrix_icc(data):
         return np.nan
     return icc2.iloc[0]
 
-def save_brain_map(correlations, active_coords, volume_shape, anat_img, file_prefix, result_prefix="active_bold_corr", map_title=None):
+def save_brain_map(correlations, active_coords, volume_shape, anat_img, file_prefix, result_prefix="active_bold_corr",
+                   map_title=None, display_threshold_ratio=None):
     coord_arrays = tuple(np.asarray(axis, dtype=int) for axis in active_coords)
     display_values = np.abs(correlations.ravel())
     volume = np.full(volume_shape, np.nan)
@@ -451,8 +453,17 @@ def save_brain_map(correlations, active_coords, volume_shape, anat_img, file_pre
     if np.any(np.isfinite(display_values)):
         display_volume = np.nan_to_num(volume, nan=0.0, posinf=0.0, neginf=0.0)
         display_volume = np.clip(display_volume, 0.0, colorbar_max)
+        clamped_ratio = float(np.clip(display_threshold_ratio, 0.0, 1.0))
+        threshold_value = float(colorbar_max * clamped_ratio)
+        display_volume[display_volume < threshold_value] = 0.0
         display_img = nib.Nifti1Image(display_volume, anat_img.affine, anat_img.header)
-        display = plotting.view_img(display_img, bg_img=anat_img, colorbar=True, symmetric_cmap=False, cmap='jet', title=map_title)
+        display = plotting.view_img(
+            display_img,
+            bg_img=anat_img,
+            colorbar=True,
+            symmetric_cmap=False,
+            cmap='jet',
+            threshold=threshold_value)
         display.save_as_html(f"{result_prefix}_{file_prefix}.html")
     return
 
@@ -797,6 +808,51 @@ def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth
             "penalty_value": penalty_value, "gamma_penalty": gamma_penalty_value, "gamma_penalty_ratio": gamma_penalty_ratio}
 
 #%%
+def solve_soc_problem_eig(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth, gamma):
+    beta_centered = run_data["beta_centered"]
+    n_components = beta_centered.shape[0]
+    penalty_matrices, total_penalty = calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth)
+
+    corr_num, corr_den = run_data["C_corr_num"], run_data["C_corr_den"]
+    A_mat, B_mat = _build_objective_matrices(total_penalty, corr_num, corr_den, gamma)
+    A_mat = 0.5 * (A_mat + A_mat.T)
+    B_mat = 0.5 * (B_mat + B_mat.T)
+
+    # Ensure B is positive definite for the generalized eigenvalue problem.
+    min_eig_B = float(np.min(np.linalg.eigvalsh(B_mat)))
+    if not np.isfinite(min_eig_B):
+        raise RuntimeError("Invalid correlation denominator matrix (non-finite eigenvalues).")
+    if min_eig_B <= 0:
+        B_mat = B_mat + (abs(min_eig_B) + 1e-8) * np.eye(n_components)
+
+    eigvals, eigvecs = eigh(A_mat, B_mat)
+    finite_mask = np.isfinite(eigvals)
+    if not np.any(finite_mask):
+        raise RuntimeError("Generalized eigenvalue solver failed to produce finite eigenvalues.")
+    min_idx = int(np.nanargmin(eigvals))
+    solution_weights = np.asarray(eigvecs[:, min_idx], dtype=np.float64).ravel()
+    b_norm = float(np.sqrt(solution_weights.T @ B_mat @ solution_weights))
+    if not np.isfinite(b_norm) or b_norm <= 0:
+        raise RuntimeError("Generalized eigenvector produced non-positive B-norm.")
+    solution_weights = solution_weights / b_norm
+
+    contributions = {label: float(solution_weights.T @ matrix @ solution_weights) for label, matrix in penalty_matrices.items()}
+    y = beta_centered.T @ solution_weights
+    penalty_value = float(solution_weights.T @ total_penalty @ solution_weights)
+    gamma_penalty_value = float(gamma * penalty_value)
+    denominator_value = float(solution_weights.T @ B_mat @ solution_weights)
+    numerator_value = float(solution_weights.T @ A_mat @ solution_weights)
+    correlation_numerator = float(solution_weights.T @ corr_num @ solution_weights)
+    gamma_penalty_ratio = gamma_penalty_value / denominator_value
+    total_loss = _total_loss_from_penalty(solution_weights, total_penalty, gamma, corr_num=corr_num, corr_den=corr_den, A_mat=A_mat, B_mat=B_mat)
+    fractional_objective = numerator_value / denominator_value
+    correlation_ratio = correlation_numerator / denominator_value
+
+    return {"weights": solution_weights, "total_loss": total_loss, "Y": y, "fractional_objective": fractional_objective,
+            "numerator": numerator_value, "denominator": denominator_value, "penalty_contributions": contributions, "corr_ratio": correlation_ratio,
+            "penalty_value": penalty_value, "gamma_penalty": gamma_penalty_value, "gamma_penalty_ratio": gamma_penalty_ratio}
+
+#%%
 
 def plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, gamma_value, output_path,
                          max_trials=10, series_label=None, trial_indices_array=None, trial_windows=None):
@@ -1074,11 +1130,12 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
 ridge_penalty = 1e-3
 solver_name = "MOSEK"
 # penalty_sweep = [(0.8, 1, 0.5, 1.2), (0, 1, 0.5, 1.2), (0.8, 0, 0.5, 1.2), (0.8, 1, 0, 1.2), (0.8, 1, 0.5, 0)]
+# penalty_sweep = [(0.8, 0, 0, 0), (0, 0.8, 0, 0), (0, 0, 0.5, 0), (0, 0, 0, 1),(0.8, 0.8, 0.5, 1)]
 # penalty_sweep = [(0.5, 0.7, 0.25, 0.8)]
-penalty_sweep = [(0.8, 1, 0.5, 1.2)]
+penalty_sweep = [(0.7, 0.7, 0.25, 0.1)]
 alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha, "smooth_penalty": smooth_alpha} for task_alpha, bold_alpha, beta_alpha, smooth_alpha in penalty_sweep]
 # gamma_sweep = [0, 0.2, 0.8]
-gamma_sweep = [2]
+gamma_sweep = [1.5]
 SAVE_PER_FOLD_VOXEL_MAPS = False  # disable individual fold voxel-weight plots; averages saved later
 
 projection_data = build_pca_dataset(bold_clean, beta_clean, behavior_matrix, nan_mask_flat, active_coords, active_flat_idx, trial_len, num_trials)
@@ -1149,7 +1206,15 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 coeff_pinv = np.asarray(train_data["coeff_pinv"])
                 voxel_weights = coeff_pinv.T @ component_weights
                 if SAVE_PER_FOLD_VOXEL_MAPS:
-                    save_brain_map(voxel_weights * 1000, train_data.get("active_coords"), anat_img.shape[:3], anat_img, file_prefix, result_prefix="voxel_weights")
+                    save_brain_map(
+                        voxel_weights * 1000,
+                        train_data.get("active_coords"),
+                        anat_img.shape[:3],
+                        anat_img,
+                        file_prefix,
+                        result_prefix="voxel_weights",
+                        display_threshold_ratio=0.8,
+                    )
 
                 projection_signal, voxel_correlations = evaluate_bold_bold_projection_corr(voxel_weights, train_data)
                 beta_projection_signal, beta_voxel_correlations = evaluate_beta_bold_projection_corr(voxel_weights, train_data)
@@ -1309,16 +1374,25 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
             fold_outputs = fold_output_tracker[metrics_key]
             avg_prefix = f"foldavg_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_smooth{smooth_alpha:g}_gamma{gamma_value:g}"
 
-            comp_weights_stack = np.stack(fold_outputs["component_weights"], axis=0)
-            comp_weights_icc = _compute_matrix_icc(comp_weights_stack)
-            print(f"  ICC (component weights across folds/components): {comp_weights_icc:.4f}" if np.isfinite(comp_weights_icc) else "  ICC (component weights) could not be computed", flush=True)
+            # comp_weights_stack = np.stack(fold_outputs["component_weights"], axis=0)
+            # comp_weights_icc = _compute_matrix_icc(comp_weights_stack)
+            # print(f"  ICC (component weights across folds/components): {comp_weights_icc:.4f}" if np.isfinite(comp_weights_icc) else "  ICC (component weights) could not be computed", flush=True)
 
             weights_stack = np.stack(fold_outputs["voxel_weights"], axis=0)
             weights_avg = np.nanmean(weights_stack, axis=0)
             weights_icc = _compute_matrix_icc(weights_stack)
             print(f"  ICC (weights across folds/voxels): {weights_icc:.4f}" if np.isfinite(weights_icc) else "  ICC (weights) could not be computed", flush=True)
             weights_title = f"ICC={weights_icc:.3f}"
-            save_brain_map(weights_avg * 1000, active_coords, volume_shape, anat_img, avg_prefix, result_prefix="voxel_weights_mean", map_title=weights_title)
+            save_brain_map(
+                weights_avg * 1000,
+                active_coords,
+                volume_shape,
+                anat_img,
+                avg_prefix,
+                result_prefix="voxel_weights_mean",
+                map_title=weights_title,
+                display_threshold_ratio=0.8,
+            )
 
             bold_corr_stack = np.stack(np.abs(fold_outputs["bold_corr"]), axis=0)
             bold_corr_avg = np.nanmean(bold_corr_stack, axis=0)
