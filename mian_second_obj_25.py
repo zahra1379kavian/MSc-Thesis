@@ -275,7 +275,7 @@ def apply_empca(bold_clean):
     Yc = Yc.T
     W = W.T
     print("begin empca...", flush=True)
-    m = empca(Yc, W, nvec=250, niter=30)
+    m = empca(Yc, W, nvec=250, niter=15)
     np.save(f'sub{sub}/empca_model_sub{sub}_ses{ses}.npy', m)
     return m
 
@@ -303,13 +303,18 @@ def build_pca_dataset(bold_clean, beta_clean, behavioral_matrix, nan_mask_flat, 
             "active_coords": active_coords, "active_flat_indices": active_flat_indices, **normalization}
 
 def _compute_global_normalization(behavior_matrix, beta_pca_full, behavior_index):
-    behavior_vector = behavior_matrix[:, behavior_index].ravel()
+    # behavior_vector = behavior_matrix[:, behavior_index].ravel()
+    raw_behavior = behavior_matrix[:, behavior_index].ravel()
+    inv_behavior = np.divide(1.0, raw_behavior, out=np.full_like(raw_behavior, np.nan, dtype=np.float64),
+                             where=np.isfinite(raw_behavior) & (raw_behavior != 0))
+    inv_max = np.nanmax(inv_behavior) if np.any(np.isfinite(inv_behavior)) else 0.0
+    behavior_vector = inv_behavior - inv_max
     behavior_finite_mask = np.isfinite(behavior_vector)
 
     behavior_centered_full = np.full_like(behavior_vector, np.nan, dtype=np.float64)
-    behavior_mean = float(np.nanmean(behavior_vector[behavior_finite_mask]))
+    behavior_mean = np.nanmean(behavior_vector[behavior_finite_mask])
     behavior_centered_full[behavior_finite_mask] = behavior_vector[behavior_finite_mask] - behavior_mean
-    behavior_norm = float(np.linalg.norm(behavior_centered_full[behavior_finite_mask]))
+    behavior_norm = np.linalg.norm(behavior_centered_full[behavior_finite_mask])
     if not np.isfinite(behavior_norm) or behavior_norm <= 0:
         behavior_norm = 1.0
 
@@ -372,14 +377,14 @@ def build_loss_corr_term(beta_components, normalized_behaviors, ridge=1e-6):
     C_d = beta_components @ beta_components.T
     skew_b = C_b - C_b.T
     skew_d = C_d - C_d.T
-    print(
-        f"C_b symmetry deviation: fro_norm={np.linalg.norm(skew_b, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_b)):.6e}",
-        flush=True,
-    )
-    print(
-        f"C_d symmetry deviation: fro_norm={np.linalg.norm(skew_d, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_d)):.6e}",
-        flush=True,
-    )
+    # print(
+    #     f"C_b symmetry deviation: fro_norm={np.linalg.norm(skew_b, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_b)):.6e}",
+    #     flush=True,
+    # )
+    # print(
+    #     f"C_d symmetry deviation: fro_norm={np.linalg.norm(skew_d, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_d)):.6e}",
+    #     flush=True,
+    # )
     C_b = 0.5 * (C_b + C_b.T)
     C_d = 0.5 * (C_d + C_d.T)
     eye = np.eye(beta_components.shape[0])
@@ -483,7 +488,7 @@ def calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smoo
     beta_penalty = alpha_beta * run_data["C_beta"]
     smooth_matrix = run_data.get("C_smooth")
     skew_smooth = smooth_matrix - smooth_matrix.T
-    print(f"C_smooth symmetry deviation: fro_norm={np.linalg.norm(skew_smooth, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_smooth)):.6e}",flush=True)
+    # print(f"C_smooth symmetry deviation: fro_norm={np.linalg.norm(skew_smooth, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_smooth)):.6e}",flush=True)
     smooth_penalty = alpha_smooth * smooth_matrix
 
     total_penalty = task_penalty + bold_penalty + beta_penalty + smooth_penalty
@@ -706,9 +711,9 @@ def prepare_data_func(projection_data, trial_indices, trial_length, run_boundary
     skew_task = C_task - C_task.T
     skew_bold = C_bold - C_bold.T
     skew_beta = C_beta - C_beta.T
-    print(f"C_task symmetry deviation: fro_norm={np.linalg.norm(skew_task, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_task)):.6e}",flush=True)
-    print(f"C_bold symmetry deviation: fro_norm={np.linalg.norm(skew_bold, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_bold)):.6e}",flush=True)
-    print(f"C_beta symmetry deviation: fro_norm={np.linalg.norm(skew_beta, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_beta)):.6e}",flush=True)
+    # print(f"C_task symmetry deviation: fro_norm={np.linalg.norm(skew_task, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_task)):.6e}",flush=True)
+    # print(f"C_bold symmetry deviation: fro_norm={np.linalg.norm(skew_bold, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_bold)):.6e}",flush=True)
+    # print(f"C_beta symmetry deviation: fro_norm={np.linalg.norm(skew_beta, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_beta)):.6e}",flush=True)
     C_task, C_bold, C_beta = standardize_matrix(C_task), standardize_matrix(C_bold), standardize_matrix(C_beta)
     
     trial_mask = np.isfinite(behavior_vector)
@@ -778,6 +783,9 @@ def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth
 
     contributions = {label: solution_weights.T @ matrix @ solution_weights for label, matrix in penalty_matrices.items()}
     y = beta_centered.T @ solution_weights
+    penalty_value = float(solution_weights.T @ total_penalty @ solution_weights)
+    gamma_penalty_value = float(gamma * penalty_value)
+    gamma_penalty_ratio = gamma_penalty_value / denominator_value
     numerator_value = solution_weights.T @ A_mat @ solution_weights
     correlation_numerator = solution_weights.T @ corr_num @ solution_weights
     total_loss = _total_loss_from_penalty(solution_weights, total_penalty, gamma, corr_num=corr_num, corr_den=corr_den, A_mat=A_mat, B_mat=B_mat)
@@ -785,7 +793,8 @@ def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth
     correlation_ratio = correlation_numerator / denominator_value
 
     return {"weights": solution_weights, "total_loss": total_loss, "Y": y, "fractional_objective": fractional_objective,
-            "numerator": numerator_value, "denominator": denominator_value, "penalty_contributions": contributions, "corr_ratio": correlation_ratio}
+            "numerator": numerator_value, "denominator": denominator_value, "penalty_contributions": contributions, "corr_ratio": correlation_ratio,
+            "penalty_value": penalty_value, "gamma_penalty": gamma_penalty_value, "gamma_penalty_ratio": gamma_penalty_ratio}
 
 #%%
 
@@ -1080,7 +1089,18 @@ projection_data["C_smooth"] = standardize_matrix(projected)
 def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projection_data):
     total_folds = len(fold_splits)
     bold_pca_components = projection_data["pca_model"].eigvec
-    aggregate_metrics = defaultdict(lambda: {"train_corr": [], "train_p": [], "test_corr": [], "test_p": [], "train_total_loss": [], "test_total_loss": []})
+    aggregate_metrics = defaultdict(
+        lambda: {
+            "train_corr": [],
+            "train_p": [],
+            "test_corr": [],
+            "test_p": [],
+            "train_total_loss": [],
+            "test_total_loss": [],
+            "train_gamma_ratio": [],
+            "test_gamma_ratio": [],
+        }
+    )
     fold_metric_records = defaultdict(lambda: defaultdict(list))
     fold_output_tracker = defaultdict(lambda: {"component_weights": [], "voxel_weights": [], "bold_corr": [], "beta_corr": []})
     metric_plot_configs = {"train_corr": {"title": "Train correlation", "ylabel": "Corr"}, "test_corr": {"title": "Test correlation", "ylabel": "Corr"},
@@ -1154,6 +1174,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 train_denominator = float(component_weights.T @ train_B @ component_weights)
                 train_corr_num_quad = float(component_weights.T @ train_data["C_corr_num"] @ component_weights)
                 train_gamma_penalty = float(gamma_value * (component_weights.T @ total_penalty_train @ component_weights))
+                train_gamma_ratio = train_gamma_penalty / train_denominator if np.isfinite(train_denominator) and train_denominator > 0 else np.nan
                 train_corr_ratio = train_corr_num_quad / train_denominator if np.isfinite(train_denominator) and train_denominator > 0 else np.nan
 
                 test_penalties, total_penalty_test = calcu_penalty_terms(test_data, task_alpha, bold_alpha, beta_alpha, smooth_alpha)
@@ -1164,6 +1185,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 test_denominator = float(component_weights.T @ test_B @ component_weights)
                 test_corr_num_quad = float(component_weights.T @ test_data["C_corr_num"] @ component_weights)
                 test_gamma_penalty = float(gamma_value * (component_weights.T @ total_penalty_test @ component_weights))
+                test_gamma_ratio = test_gamma_penalty / test_denominator if np.isfinite(test_denominator) and test_denominator > 0 else np.nan
                 test_corr_ratio = test_corr_num_quad / test_denominator if np.isfinite(test_denominator) and test_denominator > 0 else np.nan
 
                 train_metrics["total_loss"] = train_total_loss
@@ -1171,6 +1193,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
 
                 print(f"  Total loss (train objective): {train_total_loss:.6f}", flush=True)
                 print(f"  Total loss (test objective):  {test_total_loss:.6f}", flush=True)
+                print(f"  Gamma-penalty ratio -> train: {train_gamma_ratio:.6f}, test: {test_gamma_ratio:.6f}", flush=True)
                 print(f"  Train metrics -> corr: {train_metrics['pearson']:.4f}", flush=True)
                 print(f"  Test metrics  -> corr: {test_metrics['pearson']:.4f},", flush=True)
 
@@ -1188,8 +1211,12 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                     "numerator": numerator_value,
                     "denominator": denominator_value,
                     "fractional_objective": solution.get("fractional_objective"),
+                    "gamma_penalty": solution.get("gamma_penalty"),
+                    "gamma_penalty_ratio": solution.get("gamma_penalty_ratio"),
                     "train_total_loss": train_total_loss,
                     "test_total_loss": test_total_loss,
+                    "train_gamma_ratio": train_gamma_ratio,
+                    "test_gamma_ratio": test_gamma_ratio,
                     "train_corr": float(train_metrics.get("pearson", np.nan)),
                     "test_corr": float(test_metrics.get("pearson", np.nan)),
                     "train_numerator": train_numerator,
@@ -1217,6 +1244,8 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 bucket["test_p"].append(test_metrics["pearson_p"])
                 bucket["train_total_loss"].append(train_total_loss)
                 bucket["test_total_loss"].append(test_total_loss)
+                bucket["train_gamma_ratio"].append(train_gamma_ratio)
+                bucket["test_gamma_ratio"].append(test_gamma_ratio)
 
                 fold_metrics = fold_metric_records[metrics_key]
                 fold_metrics["train_corr"].append((fold_idx, np.abs(train_metrics["pearson"])))
@@ -1225,6 +1254,8 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 fold_metrics["test_p"].append((fold_idx, test_metrics["pearson_p"]))
                 fold_metrics["train_total_loss"].append((fold_idx, train_total_loss))
                 fold_metrics["test_total_loss"].append((fold_idx, test_total_loss))
+                fold_metrics["train_gamma_ratio"].append((fold_idx, train_gamma_ratio))
+                fold_metrics["test_gamma_ratio"].append((fold_idx, test_gamma_ratio))
 
     if fold_metric_records:
         print("\n===== Saving fold-wise metric box plots =====", flush=True)
@@ -1237,7 +1268,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
             train_loss_entries = metric_records.get("train_total_loss", [])
             test_loss_entries = metric_records.get("test_total_loss", [])
             for metric_name, entries in metric_records.items():
-                if metric_name in ("train_total_loss", "test_total_loss"):
+                if metric_name in ("train_total_loss", "test_total_loss", "train_gamma_ratio", "test_gamma_ratio"):
                     continue
                 config = metric_plot_configs.get(metric_name)
                 plot_title = f"{config['title']} across folds ({combo_label})"
@@ -1251,6 +1282,21 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 created_loss_plot = plot_train_test_total_loss_box(train_loss_entries, test_loss_entries, loss_title, "Objective value", loss_path)
                 if created_loss_plot:
                     print(f"  Saved train/test total loss fold plot for {combo_label} -> {created_loss_plot}", flush=True)
+
+            train_gamma_entries = metric_records.get("train_gamma_ratio", [])
+            test_gamma_entries = metric_records.get("test_gamma_ratio", [])
+            if train_gamma_entries or test_gamma_entries:
+                gamma_title = f"Gamma-penalty ratio across folds ({combo_label})"
+                gamma_path = f"gamma_penalty_ratio_{metrics_prefix}_train_vs_test.png"
+                created_gamma_plot = plot_train_test_total_loss_box(
+                    train_gamma_entries,
+                    test_gamma_entries,
+                    gamma_title,
+                    "gamma * penalty / corr_den",
+                    gamma_path,
+                )
+                if created_gamma_plot:
+                    print(f"  Saved gamma-penalty ratio fold plot for {combo_label} -> {created_gamma_plot}", flush=True)
 
     if fold_output_tracker:
         print("\n===== Saving fold-averaged spatial maps and projections =====", flush=True)
@@ -1326,6 +1372,8 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
             test_p_mean = np.nanmean(bucket["test_p"])
             train_loss_mean = np.nanmean(bucket["train_total_loss"])
             test_loss_mean = np.nanmean(bucket["test_total_loss"])
+            train_gamma_ratio_mean = np.nanmean(bucket["train_gamma_ratio"])
+            test_gamma_ratio_mean = np.nanmean(bucket["test_gamma_ratio"])
             fold_count = len(bucket["test_corr"])
 
             combo_label = (f"task={task_alpha:g}\n bold={bold_alpha:g}\n beta={beta_alpha:g}\n smooth={smooth_alpha:g}\n gamma={gamma_value:g}")
@@ -1333,7 +1381,8 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 f"(folds contributing={fold_count}): "
                 f"train corr={train_corr_mean:.4f} (p={train_p_mean:.4f}), "
                 f"test corr={test_corr_mean:.4f} (p={test_p_mean:.4f}), "
-                f"avg loss train={train_loss_mean:.4f}, test={test_loss_mean:.4f}", flush=True)
+                f"avg loss train={train_loss_mean:.4f}, test={test_loss_mean:.4f}, "
+                f"gamma_ratio train={train_gamma_ratio_mean:.4f}, test={test_gamma_ratio_mean:.4f}", flush=True)
 
 
 DEFAULT_NUM_FOLDS = 5
