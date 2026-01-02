@@ -3,8 +3,11 @@ __pycache__
 *.tmp
 *.csv
 *.json
+*.jsonl
+*.md
+*.xml
 !*.py
-!*.ipynb"
+!*.ipynb
 
 *.npy
 *.mat
@@ -13,6 +16,7 @@ __pycache__
 *.nii.gz
 empca/
 mosek/
+nilearn_data/
 *.png
 *.html
 *.sh

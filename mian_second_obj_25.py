@@ -156,12 +156,15 @@ def compute_distance_weighted_adjacency(coords, affine, radius_mm=3.0, sigma_mm=
     degree_matrix = sparse.diags(degrees).tocsr()  # CSR keeps diagonal structure but allows slicing.
     return adjacency, degree_matrix
 # %% 
-ses = 2
+ses = 1
 sub = "09"
 num_trials = 180
 trial_len = 9
 behave_indice = 1 #1/RT
 trials_per_run = num_trials // 2
+
+# Save a quick visualization of the mean beta activation (averaged over trials) as an interactive HTML.
+
 
 base_path = f"/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/sub{sub}"
 brain_mask_path = f"{base_path}/sub-pd0{sub}_ses-{ses}_T1w_brain_mask.nii.gz"
@@ -174,8 +177,8 @@ brain_mask = nib.load(brain_mask_path).get_fdata().astype(np.float16)
 csf_mask = nib.load(csf_mask_path).get_fdata().astype(np.float16)
 gray_mask = nib.load(gray_mask_path).get_fdata().astype(np.float16)
 
-glm_dict = np.load(f"{base_path}/TYPED_FITHRF_GLMDENOISE_RR_sub{sub}_ses{ses}.npy", allow_pickle=True).item()
-beta_glm = glm_dict["betasmd"]
+# glm_dict = np.load(f"{base_path}/TYPED_FITHRF_GLMDENOISE_RR_sub{sub}_ses{ses}.npy", allow_pickle=True).item()
+# beta_glm = glm_dict["betasmd"]
 
 nan_mask_flat_run1 = np.load(f"sub{sub}/nan_mask_flat_sub{sub}_ses{ses}_run1.npy")
 nan_mask_flat_run2 = np.load(f"sub{sub}/nan_mask_flat_sub{sub}_ses{ses}_run2.npy")
@@ -453,18 +456,11 @@ def save_brain_map(correlations, active_coords, volume_shape, anat_img, file_pre
     if np.any(np.isfinite(display_values)):
         display_volume = np.nan_to_num(volume, nan=0.0, posinf=0.0, neginf=0.0)
         display_volume = np.clip(display_volume, 0.0, colorbar_max)
-        clamped_ratio = float(np.clip(display_threshold_ratio, 0.0, 1.0))
-        threshold_value = float(colorbar_max * clamped_ratio)
+        clamped_ratio = np.clip(display_threshold_ratio, 0.0, 1.0)
+        threshold_value = colorbar_max * clamped_ratio
         display_volume[display_volume < threshold_value] = 0.0
         display_img = nib.Nifti1Image(display_volume, anat_img.affine, anat_img.header)
-        display = plotting.view_img(
-            display_img,
-            bg_img=anat_img,
-            colorbar=True,
-            symmetric_cmap=False,
-            cmap='jet',
-            threshold=threshold_value)
-        display.save_as_html(f"{result_prefix}_{file_prefix}.html")
+        display = plotting.view_img(display_img, bg_img=anat_img, colorbar=True, symmetric_cmap=False,cmap='jet', threshold=threshold_value)
     return
 
 def _load_projection_series(series_path):
@@ -530,7 +526,7 @@ def calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smoo
 #     return total_loss, penalty_value, corr_ratio, corr_num, corr_den
 
 def _build_objective_matrices(total_penalty, corr_num, corr_den, gamma_value, eps=1e-8):
-    A_mat = gamma_value * total_penalty - corr_num
+    A_mat = gamma_value * total_penalty - 0 * corr_num
     A_mat = 0.5 * (A_mat + A_mat.T)
     B_mat = 0.5 * (corr_den + corr_den.T)
     eye = np.eye(A_mat.shape[0], dtype=np.float64)
@@ -734,6 +730,7 @@ def prepare_data_func(projection_data, trial_indices, trial_length, run_boundary
 
     beta_observed = beta_pca[:, trial_mask]
     beta_centered = beta_centered_subset[:, trial_mask]
+
     # Correlation term (r^2) — keep the ratio intact, but rescale both matrices by a shared scalar
     # so their magnitude is comparable to the (standardized) penalty matrices. Using a common scale
     # preserves w^T C_corr_num w / w^T C_corr_den w while preventing tiny denominators.
@@ -771,8 +768,10 @@ def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth
         denominator = weights.T @ B_mat @ weights
         grad_num = 2.0 * (A_mat @ weights)
         grad_den = 2.0 * (B_mat @ weights)
-        objective_value = numerator / denominator
-        gradient = (grad_num * denominator - grad_den * numerator) / (denominator**2)
+        # objective_value = numerator / denominator
+        objective_value = numerator / 1
+        # gradient = (grad_num * denominator - grad_den * numerator) / (denominator**2)
+        gradient = grad_num
         return objective_value, gradient
     def _objective(weights):
         value, _ = _objective_with_grad(weights)
@@ -1131,12 +1130,12 @@ ridge_penalty = 1e-3
 solver_name = "MOSEK"
 # penalty_sweep = [(0.8, 1, 0.5, 1.2), (0, 1, 0.5, 1.2), (0.8, 0, 0.5, 1.2), (0.8, 1, 0, 1.2), (0.8, 1, 0.5, 0)]
 # penalty_sweep = [(0.8, 0, 0, 0), (0, 0.8, 0, 0), (0, 0, 0.5, 0), (0, 0, 0, 1),(0.8, 0.8, 0.5, 1)]
-# penalty_sweep = [(0.5, 0.7, 0.25, 0.8)]
-penalty_sweep = [(0.7, 0.7, 0.25, 0.1)]
+penalty_sweep = [(0.7, 0, 0, 0)]
+# penalty_sweep = [(0.7, 0.7, 0.25, 0.1)]
 alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha, "smooth_penalty": smooth_alpha} for task_alpha, bold_alpha, beta_alpha, smooth_alpha in penalty_sweep]
 # gamma_sweep = [0, 0.2, 0.8]
 gamma_sweep = [1.5]
-SAVE_PER_FOLD_VOXEL_MAPS = False  # disable individual fold voxel-weight plots; averages saved later
+# SAVE_PER_FOLD_VOXEL_MAPS = False  # disable individual fold voxel-weight plots; averages saved later
 
 projection_data = build_pca_dataset(bold_clean, beta_clean, behavior_matrix, nan_mask_flat, active_coords, active_flat_idx, trial_len, num_trials)
 coeff_pinv = projection_data["coeff_pinv"]
@@ -1146,23 +1145,14 @@ projection_data["C_smooth"] = standardize_matrix(projected)
 def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projection_data):
     total_folds = len(fold_splits)
     bold_pca_components = projection_data["pca_model"].eigvec
-    aggregate_metrics = defaultdict(
-        lambda: {
-            "train_corr": [],
-            "train_p": [],
-            "test_corr": [],
-            "test_p": [],
-            "train_total_loss": [],
-            "test_total_loss": [],
-            "train_gamma_ratio": [],
-            "test_gamma_ratio": [],
-        }
-    )
+    aggregate_metrics = defaultdict(lambda: {"train_corr": [], "train_p": [], "test_corr": [], "test_p": [],
+                                             "train_total_loss": [], "test_total_loss": [], "train_gamma_ratio": [], "test_gamma_ratio": []})
     fold_metric_records = defaultdict(lambda: defaultdict(list))
     fold_output_tracker = defaultdict(lambda: {"component_weights": [], "voxel_weights": [], "bold_corr": [], "beta_corr": []})
     metric_plot_configs = {"train_corr": {"title": "Train correlation", "ylabel": "Corr"}, "test_corr": {"title": "Test correlation", "ylabel": "Corr"},
                            "train_p": {"title": "Train correlation p-value", "ylabel": "p-value", "threshold": 0.05},
                            "test_p": {"title": "Test correlation p-value", "ylabel": "p-value", "threshold": 0.05}}
+
     for fold_idx, split in enumerate(fold_splits, start=1):
         print(f"\n===== Fold {fold_idx}/{total_folds} =====", flush=True)
         test_indices, train_indices = split["test_indices"], split["train_indices"]
@@ -1205,16 +1195,6 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 component_weights = np.asarray(solution["weights"], dtype=np.float64)
                 coeff_pinv = np.asarray(train_data["coeff_pinv"])
                 voxel_weights = coeff_pinv.T @ component_weights
-                if SAVE_PER_FOLD_VOXEL_MAPS:
-                    save_brain_map(
-                        voxel_weights * 1000,
-                        train_data.get("active_coords"),
-                        anat_img.shape[:3],
-                        anat_img,
-                        file_prefix,
-                        result_prefix="voxel_weights",
-                        display_threshold_ratio=0.8,
-                    )
 
                 projection_signal, voxel_correlations = evaluate_bold_bold_projection_corr(voxel_weights, train_data)
                 beta_projection_signal, beta_voxel_correlations = evaluate_beta_bold_projection_corr(voxel_weights, train_data)
@@ -1353,13 +1333,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
             if train_gamma_entries or test_gamma_entries:
                 gamma_title = f"Gamma-penalty ratio across folds ({combo_label})"
                 gamma_path = f"gamma_penalty_ratio_{metrics_prefix}_train_vs_test.png"
-                created_gamma_plot = plot_train_test_total_loss_box(
-                    train_gamma_entries,
-                    test_gamma_entries,
-                    gamma_title,
-                    "gamma * penalty / corr_den",
-                    gamma_path,
-                )
+                created_gamma_plot = plot_train_test_total_loss_box(train_gamma_entries, test_gamma_entries, gamma_title, "gamma * penalty / corr_den", gamma_path)
                 if created_gamma_plot:
                     print(f"  Saved gamma-penalty ratio fold plot for {combo_label} -> {created_gamma_plot}", flush=True)
 
@@ -1383,30 +1357,24 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
             weights_icc = _compute_matrix_icc(weights_stack)
             print(f"  ICC (weights across folds/voxels): {weights_icc:.4f}" if np.isfinite(weights_icc) else "  ICC (weights) could not be computed", flush=True)
             weights_title = f"ICC={weights_icc:.3f}"
-            save_brain_map(
-                weights_avg * 1000,
-                active_coords,
-                volume_shape,
-                anat_img,
-                avg_prefix,
-                result_prefix="voxel_weights_mean",
-                map_title=weights_title,
-                display_threshold_ratio=0.8,
-            )
+            save_brain_map(weights_avg * 1000, active_coords, volume_shape, anat_img, avg_prefix, result_prefix="voxel_weights_mean", map_title=weights_title,
+                display_threshold_ratio=0.8)
 
             bold_corr_stack = np.stack(np.abs(fold_outputs["bold_corr"]), axis=0)
             bold_corr_avg = np.nanmean(bold_corr_stack, axis=0)
             bold_corr_icc = _compute_matrix_icc(bold_corr_stack)
             print(f"  ICC (bold corr across folds/voxels): {bold_corr_icc:.4f}" if np.isfinite(bold_corr_icc) else "  ICC (bold corr) could not be computed", flush=True)
             bold_title = f"ICC={bold_corr_icc:.3f}"
-            save_brain_map(bold_corr_avg, active_coords, volume_shape, anat_img, avg_prefix, result_prefix="active_bold_corr_mean", map_title=bold_title)
+            save_brain_map(bold_corr_avg, active_coords, volume_shape, anat_img, avg_prefix, result_prefix="active_bold_corr_mean", map_title=bold_title,
+                           display_threshold_ratio=0.8)
 
             beta_corr_stack = np.stack(np.abs(fold_outputs["beta_corr"]), axis=0)
             beta_corr_avg = np.nanmean(beta_corr_stack, axis=0)
             beta_corr_icc = _compute_matrix_icc(beta_corr_stack)
             print(f"  ICC (beta corr across folds/voxels): {beta_corr_icc:.4f}" if np.isfinite(beta_corr_icc) else "  ICC (beta corr) could not be computed", flush=True)
             beta_title = f"ICC={beta_corr_icc:.3f}"
-            save_brain_map(beta_corr_avg, active_coords, volume_shape, anat_img, avg_prefix, result_prefix=f"active_beta_corr_mean", map_title=beta_title)
+            save_brain_map(beta_corr_avg, active_coords, volume_shape, anat_img, avg_prefix, result_prefix=f"active_beta_corr_mean", map_title=beta_title,
+                           display_threshold_ratio=0.8)
 
             projection_avg = _compute_projection(weights_avg, projection_data["beta_clean"])
             avg_series_key = (task_alpha, bold_alpha, beta_alpha, smooth_alpha)
@@ -1458,9 +1426,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 f"avg loss train={train_loss_mean:.4f}, test={test_loss_mean:.4f}, "
                 f"gamma_ratio train={train_gamma_ratio_mean:.4f}, test={test_gamma_ratio_mean:.4f}", flush=True)
 
-
-DEFAULT_NUM_FOLDS = 5
-
+    
 
 if __name__ == "__main__":
     combo_idx = None
@@ -1478,13 +1444,16 @@ if __name__ == "__main__":
         print(f"Running combo_idx={combo_idx} (alpha_idx={alpha_idx}, gamma_idx={gamma_idx})", flush=True)
     else:
         print("Running full alpha/gamma sweep (no combo index provided).", flush=True)
-
+    
     num_folds_env = os.environ.get("FMRI_NUM_FOLDS", "").strip()
     if num_folds_env:
         num_folds = int(num_folds_env)
     else:
-        num_folds = DEFAULT_NUM_FOLDS
+        num_folds = 5
 
     fold_splits = build_custom_kfold_splits(num_trials, num_folds=num_folds, trials_per_run=trials_per_run)
     print(f"Constructed {len(fold_splits)} fold pairs using num_folds={num_folds} per run.", flush=True)
     run_cross_run_experiment(selected_alphas, selected_gammas, fold_splits, projection_data)
+
+    # trial_indices = np.arange(projection_data["behavior_matrix"].shape[0], dtype=int)
+    # run_data = prepare_data_func(projection_data, trial_indices, trial_len, trials_per_run, projection_data)

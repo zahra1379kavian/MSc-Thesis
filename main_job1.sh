@@ -19,4 +19,6 @@ export HOME=/scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis
 source /scratch/st-mmckeown-1/zkavian/fmri_models/myenv/bin/activate
 cd /scratch/st-mmckeown-1/zkavian/fmri_models/MSc-Thesis/
 
-python mian_second_obj_25.py
+# python mian_second_obj_25.py
+# python tmp.py
+python trial_roi_beta_analysis.py
